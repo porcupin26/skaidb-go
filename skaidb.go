@@ -20,6 +20,8 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/binary"
@@ -31,6 +33,7 @@ import (
 	"math/big"
 	"net"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -64,6 +67,10 @@ type config struct {
 	user        string
 	password    string
 	consistency byte
+	tls         bool
+	tlsCA       string
+	tlsInsecure bool
+	tlsName     string
 }
 
 func parseDSN(dsn string) (config, error) {
@@ -94,7 +101,61 @@ func parseDSN(dsn string) (config, error) {
 	default:
 		return config{}, fmt.Errorf("skaidb: bad consistency %q", u.Query().Get("consistency"))
 	}
+	// TLS. A server with client_tls = required refuses plaintext outright, so
+	// without these a cluster is simply unreachable. Any of the three knobs
+	// turns TLS on: tls=true, a CA file to verify against, or tls_insecure.
+	q := u.Query()
+	cfg.tlsCA = q.Get("tls_ca")
+	switch strings.ToLower(q.Get("tls_insecure")) {
+	case "", "false", "0":
+	case "true", "1":
+		cfg.tlsInsecure = true
+	default:
+		return config{}, fmt.Errorf("skaidb: bad tls_insecure %q", q.Get("tls_insecure"))
+	}
+	switch strings.ToLower(q.Get("tls")) {
+	case "", "false", "0":
+	case "true", "1":
+		cfg.tls = true
+	default:
+		return config{}, fmt.Errorf("skaidb: bad tls %q", q.Get("tls"))
+	}
+	cfg.tls = cfg.tls || cfg.tlsCA != "" || cfg.tlsInsecure
+	// SNI must match a SAN on the server certificate, which is usually not
+	// the address you dialled — skaidb's own certs carry DNS:skaidb.
+	cfg.tlsName = q.Get("tls_server_name")
+	if cfg.tlsName == "" {
+		cfg.tlsName = "skaidb"
+	}
 	return cfg, nil
+}
+
+// tlsWrap upgrades an established TCP connection to TLS and completes the
+// handshake before any protocol byte is written, so a failure here is
+// reported as a connect error rather than a mid-handshake protocol error.
+func tlsWrap(nc net.Conn, cfg config) (net.Conn, error) {
+	tcfg := &tls.Config{ServerName: cfg.tlsName}
+	if cfg.tlsInsecure {
+		// Encrypts, but authenticates nothing: a man in the middle can
+		// present any certificate. For development against a self-signed
+		// node only — pass tls_ca in anything that matters.
+		tcfg.InsecureSkipVerify = true
+	} else if cfg.tlsCA != "" {
+		pem, err := os.ReadFile(cfg.tlsCA)
+		if err != nil {
+			return nil, fmt.Errorf("skaidb: cannot read tls_ca %q: %w", cfg.tlsCA, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("skaidb: no certificates found in tls_ca %q", cfg.tlsCA)
+		}
+		tcfg.RootCAs = pool
+	}
+	tc := tls.Client(nc, tcfg)
+	if err := tc.Handshake(); err != nil {
+		return nil, fmt.Errorf("skaidb: TLS handshake failed: %w", err)
+	}
+	return tc, nil
 }
 
 // ---- connection ------------------------------------------------------------
@@ -112,6 +173,14 @@ func dial(cfg config) (*conn, error) {
 	}
 	if tcp, ok := nc.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
+	}
+	if cfg.tls {
+		tc, err := tlsWrap(nc, cfg)
+		if err != nil {
+			nc.Close()
+			return nil, err
+		}
+		nc = tc
 	}
 	c := &conn{nc: nc, consistency: cfg.consistency}
 	if err := c.handshake(cfg.user, cfg.password); err != nil {

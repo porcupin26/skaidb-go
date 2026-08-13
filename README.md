@@ -38,12 +38,19 @@ for rows.Next() {
 ### DSN
 
 ```
-skaidb://[user[:password]@]host[:port]/?consistency=quorum
+skaidb://[user[:password]@]host[:port]/?consistency=quorum&tls_ca=/path/ca.crt
 ```
 
 - `port` defaults to `7000`.
 - `consistency` is `one`, `quorum` (default), or `all`.
 - Omit `user`/`password` for a server with auth disabled.
+- `tls=true` enables TLS; it is implied by either option below. A server with
+  `client_tls = required` refuses plaintext, so one of these is mandatory there.
+- `tls_ca=<path>` verifies the server certificate against a PEM CA bundle.
+- `tls_insecure=true` encrypts without verifying anything — development only.
+- `tls_server_name=<name>` sets SNI; it must match a SAN on the server
+  certificate and defaults to `skaidb`, which is what skaidb's own certs carry
+  (so it usually is *not* the address you dialled).
 
 ### Notes
 
