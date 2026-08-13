@@ -67,6 +67,7 @@ type config struct {
 	user        string
 	password    string
 	consistency byte
+	database    string
 	tls         bool
 	tlsCA       string
 	tlsInsecure bool
@@ -91,6 +92,8 @@ func parseDSN(dsn string) (config, error) {
 	if !strings.Contains(cfg.addr, ":") {
 		cfg.addr += ":7000"
 	}
+	// Session database from the URL path: skaidb://host:7000/app
+	cfg.database = strings.TrimPrefix(u.Path, "/")
 	switch strings.ToLower(u.Query().Get("consistency")) {
 	case "one":
 		cfg.consistency = consistencyOne
@@ -186,6 +189,16 @@ func dial(cfg config) (*conn, error) {
 	if err := c.handshake(cfg.user, cfg.password); err != nil {
 		nc.Close()
 		return nil, err
+	}
+	// Session database from the DSN path (skaidb://host:port/app). USE is
+	// per-connection session state, so it must run on every dial — including
+	// the ones database/sql makes to grow the pool, which is exactly why this
+	// belongs here and not in the caller.
+	if cfg.database != "" {
+		if _, err := c.exec(`USE "` + strings.ReplaceAll(cfg.database, `"`, `""`) + `"`); err != nil {
+			nc.Close()
+			return nil, err
+		}
 	}
 	return c, nil
 }
