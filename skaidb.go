@@ -374,7 +374,33 @@ func (c *conn) Begin() (driver.Tx, error) {
 // outright, so an array or a document could never reach the wire.
 func (c *conn) CheckNamedValue(nv *driver.NamedValue) error { return nil }
 
+// streamKey marks a context as requesting streamed delivery.
+type streamKey struct{}
+
+// WithStreaming marks ctx so QueryContext streams the result instead of
+// buffering it: the client holds one chunk rather than the whole set. Use it
+// for exports and large scans.
+//
+//	rows, err := db.QueryContext(skaidb.WithStreaming(ctx), "SELECT ...")
+//
+// Parameters are not supported on this path — the streaming opcode carries
+// SQL text, so bind values yourself or use a parameterless statement. Falls
+// back to a buffered query against a server too old to know the opcode.
+func WithStreaming(ctx context.Context) context.Context {
+	return context.WithValue(ctx, streamKey{}, true)
+}
+
 func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if ctx != nil && ctx.Value(streamKey{}) != nil && len(args) == 0 {
+		rs, err := c.streamQuery(query)
+		if err == nil {
+			return rs, nil
+		}
+		if !errors.Is(err, errNoStreaming) {
+			return nil, err
+		}
+		// fall through to the buffered path
+	}
 	if len(args) > 0 {
 		r, err := c.preparedRoundtrip(query, args)
 		if err == nil {
@@ -603,6 +629,29 @@ func (c *conn) query(sqlText string) (driver.Rows, error) {
 	return c.readRows(r)
 }
 
+// readRowsBody parses a Rows frame whose tag has already been consumed.
+func (c *conn) readRowsBody(r *reader) (driver.Rows, error) {
+	ncols := int(r.u32())
+	cols := make([]string, ncols)
+	for i := range cols {
+		cols[i] = r.text()
+	}
+	nrows := int(r.u32())
+	data := make([][]driver.Value, nrows)
+	for i := 0; i < nrows; i++ {
+		ncells := int(r.u32())
+		row := make([]driver.Value, ncells)
+		for j := 0; j < ncells; j++ {
+			row[j] = decodeValue(&reader{buf: r.blob()})
+		}
+		data[i] = row
+	}
+	if r.err != nil {
+		return nil, r.err
+	}
+	return &rows{cols: cols, data: data}, nil
+}
+
 func (c *conn) readRows(r *reader) (driver.Rows, error) {
 	switch tag := r.u8(); tag {
 	case 0: // Rows
@@ -688,13 +737,117 @@ type rows struct {
 	cols []string
 	data [][]driver.Value
 	pos  int
+	// Streaming state (nil c = fully materialised, the classic path).
+	c    *conn
+	done bool
+}
+
+// streamRows issues OP_QUERY_STREAM and returns rows that pull chunks from
+// the wire as database/sql asks for them, so the client holds one chunk
+// rather than the whole result. database/sql's Rows.Next is already
+// pull-based, so this is a better fit than materialising and walking a
+// slice — which is what the non-streaming path does.
+//
+// Falls back to the buffered path when the server does not know the opcode
+// (older servers answer Error) or when the statement is not row-producing.
+func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
+	if c.closed {
+		return nil, fmt.Errorf("skaidb: connection closed")
+	}
+	body := []byte(sqlText)
+	req := make([]byte, 0, 6+len(body))
+	req = append(req, 5, c.consistency) // OP_QUERY_STREAM
+	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
+	req = append(req, body...)
+	if err := c.writeFrame(req); err != nil {
+		return nil, c.transportErr(err, false)
+	}
+	frame, err := c.readFrame()
+	if err != nil {
+		return nil, c.transportErr(err, true)
+	}
+	r := &reader{buf: frame}
+	switch r.u8() {
+	case 5: // RowsHeader — a real stream follows
+		ncols := int(r.u32())
+		cols := make([]string, ncols)
+		for i := range cols {
+			cols[i] = r.text()
+		}
+		if r.err != nil {
+			return nil, r.err
+		}
+		return &rows{cols: cols, c: c}, nil
+	case 0: // Rows — server chose to answer in one frame
+		return c.readRowsBody(r)
+	case 1, 2: // Mutation / Ddl through a streaming call
+		return &rows{cols: []string{}, done: true}, nil
+	case 3:
+		msg := r.text()
+		if strings.Contains(msg, "unknown opcode") {
+			return nil, errNoStreaming
+		}
+		return nil, fmt.Errorf("skaidb: %s", msg)
+	}
+	return nil, fmt.Errorf("skaidb: unexpected response to stream request")
+}
+
+// errNoStreaming marks a server too old to know OP_QUERY_STREAM.
+var errNoStreaming = fmt.Errorf("skaidb: server does not support streaming")
+
+// fill pulls the next chunk. io.EOF once RowsEnd arrives.
+func (r *rows) fill() error {
+	for {
+		frame, err := r.c.readFrame()
+		if err != nil {
+			r.done = true
+			return r.c.transportErr(err, true)
+		}
+		rd := &reader{buf: frame}
+		switch rd.u8() {
+		case 6: // RowsChunk
+			n := int(rd.u32())
+			if n == 0 {
+				continue // empty chunk: keep reading
+			}
+			data := make([][]driver.Value, n)
+			for i := 0; i < n; i++ {
+				ncells := int(rd.u32())
+				row := make([]driver.Value, ncells)
+				for j := 0; j < ncells; j++ {
+					row[j] = decodeValue(&reader{buf: rd.blob()})
+				}
+				data[i] = row
+			}
+			if rd.err != nil {
+				r.done = true
+				return rd.err
+			}
+			r.data, r.pos = data, 0
+			return nil
+		case 7: // RowsEnd
+			r.done = true
+			return io.EOF
+		case 3: // Error mid-stream: rows already delivered stay valid
+			r.done = true
+			return fmt.Errorf("skaidb: %s", rd.text())
+		default:
+			r.done = true
+			return fmt.Errorf("skaidb: unexpected frame in stream")
+		}
+	}
 }
 
 func (r *rows) Columns() []string { return r.cols }
 func (r *rows) Close() error      { return nil }
 func (r *rows) Next(dest []driver.Value) error {
 	if r.pos >= len(r.data) {
-		return io.EOF
+		if r.c == nil || r.done {
+			return io.EOF
+		}
+		if err := r.fill(); err != nil {
+			return err
+		}
 	}
 	copy(dest, r.data[r.pos])
 	r.pos++
