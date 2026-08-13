@@ -32,6 +32,7 @@ import (
 	"io"
 	"math"
 	"math/big"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -66,7 +67,7 @@ func (d *drv) Open(dsn string) (driver.Conn, error) {
 }
 
 type config struct {
-	addr        string
+	addrs       []string
 	user        string
 	password    string
 	consistency byte
@@ -85,15 +86,28 @@ func parseDSN(dsn string) (config, error) {
 	if u.Scheme != "skaidb" {
 		return config{}, fmt.Errorf("skaidb: DSN scheme must be skaidb://")
 	}
-	cfg := config{addr: u.Host, user: "anonymous", consistency: consistencyQuorum}
+	cfg := config{user: "anonymous", consistency: consistencyQuorum}
 	if u.User != nil {
 		cfg.user = u.User.Username()
 		if p, ok := u.User.Password(); ok {
 			cfg.password = p
 		}
 	}
-	if !strings.Contains(cfg.addr, ":") {
-		cfg.addr += ":7000"
+	// Seeds: skaidb://user:pass@host1:7000,host2:7000,host3/db . skaidb is
+	// leaderless, so any node serves — a seed list is just "somewhere to
+	// land", with no primary to discover.
+	for _, h := range strings.Split(u.Host, ",") {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			continue
+		}
+		if !strings.Contains(h, ":") {
+			h += ":7000"
+		}
+		cfg.addrs = append(cfg.addrs, h)
+	}
+	if len(cfg.addrs) == 0 {
+		return config{}, fmt.Errorf("skaidb: DSN has no host")
 	}
 	// Session database from the URL path: skaidb://host:7000/app
 	cfg.database = strings.TrimPrefix(u.Path, "/")
@@ -175,11 +189,55 @@ type conn struct {
 	nc          net.Conn
 	consistency byte
 	closed      bool
+	broken      bool
 	prepared    map[string]preparedStmt
 }
 
+// IsValid implements driver.Validator: database/sql asks before handing a
+// pooled connection out again, so a socket broken by a transport error is
+// discarded instead of failing the next caller. The replacement is dialled
+// through Open, which walks the seed list — that is where failover happens.
+func (c *conn) IsValid() bool { return !c.closed && !c.broken }
+
+// transportErr classifies a mid-statement I/O failure.
+//
+// `sent` says whether the request reached the wire. If it did NOT, the server
+// cannot have executed anything, so returning driver.ErrBadConn is safe and
+// database/sql transparently retries the statement on a fresh connection —
+// which re-dials and may land on a different node. If it DID, the statement's
+// fate is unknown: it may have been applied and only the reply lost. Retrying
+// then could double-apply a non-idempotent write (an UPDATE ... SET n = n + 1
+// is not an upsert), so the error is surfaced to the caller instead. The
+// connection is marked broken either way.
+func (c *conn) transportErr(err error, sent bool) error {
+	c.broken = true
+	if !sent {
+		return driver.ErrBadConn
+	}
+	return fmt.Errorf("skaidb: connection lost mid-statement (statement may or may not have applied): %w", err)
+}
+
+// dial tries the seeds until one connects AND authenticates, so a node that
+// accepts TCP but is unhealthy does not swallow the attempt. The order is
+// shuffled per dial: database/sql opens connections on demand, so shuffling
+// spreads a pool across the cluster instead of piling it on the first seed.
 func dial(cfg config) (*conn, error) {
-	nc, err := net.DialTimeout("tcp", cfg.addr, 10*time.Second)
+	order := make([]string, len(cfg.addrs))
+	copy(order, cfg.addrs)
+	rand.Shuffle(len(order), func(i, j int) { order[i], order[j] = order[j], order[i] })
+	var lastErr error
+	for _, addr := range order {
+		c, err := dialOne(cfg, addr)
+		if err == nil {
+			return c, nil
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("skaidb: no reachable endpoint in %v: %w", cfg.addrs, lastErr)
+}
+
+func dialOne(cfg config, addr string) (*conn, error) {
+	nc, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("skaidb: connect failed: %w", err)
 	}
@@ -509,11 +567,11 @@ func (c *conn) sendPrepared(id uint32, args []driver.NamedValue) (*reader, error
 		req = append(req, vb...)
 	}
 	if err := c.writeFrame(req); err != nil {
-		return nil, err
+		return nil, c.transportErr(err, false)
 	}
 	frame, err := c.readFrame()
 	if err != nil {
-		return nil, err
+		return nil, c.transportErr(err, true)
 	}
 	return &reader{buf: frame}, nil
 }
@@ -528,11 +586,11 @@ func (c *conn) sendQuery(sqlText string) (*reader, error) {
 	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
 	req = append(req, body...)
 	if err := c.writeFrame(req); err != nil {
-		return nil, err
+		return nil, c.transportErr(err, false)
 	}
 	frame, err := c.readFrame()
 	if err != nil {
-		return nil, err
+		return nil, c.transportErr(err, true)
 	}
 	return &reader{buf: frame}, nil
 }
