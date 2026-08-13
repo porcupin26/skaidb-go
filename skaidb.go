@@ -27,6 +27,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -34,6 +35,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -163,10 +166,16 @@ func tlsWrap(nc net.Conn, cfg config) (net.Conn, error) {
 
 // ---- connection ------------------------------------------------------------
 
+type preparedStmt struct {
+	id      uint32
+	nparams int
+}
+
 type conn struct {
 	nc          net.Conn
 	consistency byte
 	closed      bool
+	prepared    map[string]preparedStmt
 }
 
 func dial(cfg config) (*conn, error) {
@@ -185,7 +194,7 @@ func dial(cfg config) (*conn, error) {
 		}
 		nc = tc
 	}
-	c := &conn{nc: nc, consistency: cfg.consistency}
+	c := &conn{nc: nc, consistency: cfg.consistency, prepared: map[string]preparedStmt{}}
 	if err := c.handshake(cfg.user, cfg.password); err != nil {
 		nc.Close()
 		return nil, err
@@ -302,7 +311,21 @@ func (c *conn) Begin() (driver.Tx, error) {
 	return nil, fmt.Errorf("skaidb: transactions are not supported")
 }
 
-func (c *conn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+// CheckNamedValue accepts ANY Go value. Without it database/sql pre-converts
+// arguments to its own small driver.Value set and rejects slices and maps
+// outright, so an array or a document could never reach the wire.
+func (c *conn) CheckNamedValue(nv *driver.NamedValue) error { return nil }
+
+func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if len(args) > 0 {
+		r, err := c.preparedRoundtrip(query, args)
+		if err == nil {
+			return c.readRows(r)
+		}
+		if !errors.Is(err, errUnpreparable) {
+			return nil, err
+		}
+	}
 	sqlText, err := bind(query, args)
 	if err != nil {
 		return nil, err
@@ -310,12 +333,189 @@ func (c *conn) QueryContext(_ context.Context, query string, args []driver.Named
 	return c.query(sqlText)
 }
 
-func (c *conn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+// preparedRoundtrip prepares (or reuses) the statement and executes it with
+// typed parameters. Returns errUnpreparable for statement kinds the server
+// declines, so the caller can fall back to client-side text binding.
+func (c *conn) preparedRoundtrip(query string, args []driver.NamedValue) (*reader, error) {
+	id, nparams, err := c.prepareServer(query)
+	if err != nil {
+		return nil, err
+	}
+	if nparams != len(args) {
+		return nil, fmt.Errorf("skaidb: statement expects %d parameters, got %d", nparams, len(args))
+	}
+	return c.sendPrepared(id, args)
+}
+
+func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if len(args) > 0 {
+		r, err := c.preparedRoundtrip(query, args)
+		if err == nil {
+			return c.readResult(r)
+		}
+		if !errors.Is(err, errUnpreparable) {
+			return nil, err
+		}
+	}
 	sqlText, err := bind(query, args)
 	if err != nil {
 		return nil, err
 	}
 	return c.exec(sqlText)
+}
+
+// encodeValue writes v as a TYPED skaidb value (tag + payload) — the inverse
+// of decodeValue. This is what server-side prepared binding buys: arrays and
+// documents have no SQL literal form, so they can only travel as typed
+// values, never as interpolated text.
+func encodeValue(out []byte, v any) ([]byte, error) {
+	switch x := v.(type) {
+	case nil:
+		return append(out, 0), nil
+	case bool:
+		b := byte(0)
+		if x {
+			b = 1
+		}
+		return append(out, 1, b), nil
+	case int:
+		return binary.LittleEndian.AppendUint64(append(out, 2), uint64(int64(x))), nil
+	case int32:
+		return binary.LittleEndian.AppendUint64(append(out, 2), uint64(int64(x))), nil
+	case int64:
+		return binary.LittleEndian.AppendUint64(append(out, 2), uint64(x)), nil
+	case float32:
+		return encodeValue(out, float64(x))
+	case float64:
+		if math.IsNaN(x) || math.IsInf(x, 0) {
+			return nil, fmt.Errorf("skaidb: cannot bind NaN/Infinity")
+		}
+		return binary.LittleEndian.AppendUint64(append(out, 3), math.Float64bits(x)), nil
+	case string:
+		out = binary.LittleEndian.AppendUint32(append(out, 5), uint32(len(x)))
+		return append(out, x...), nil
+	case []byte:
+		out = binary.LittleEndian.AppendUint32(append(out, 6), uint32(len(x)))
+		return append(out, x...), nil
+	case time.Time:
+		return binary.LittleEndian.AppendUint64(append(out, 8), uint64(x.UnixMilli())), nil
+	case []any:
+		out = binary.LittleEndian.AppendUint32(append(out, 9), uint32(len(x)))
+		var err error
+		for _, item := range x {
+			if out, err = encodeValue(out, item); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	case map[string]any:
+		out = binary.LittleEndian.AppendUint32(append(out, 10), uint32(len(x)))
+		// Sorted so the same map always produces the same bytes.
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var err error
+		for _, k := range keys {
+			out = binary.LittleEndian.AppendUint32(out, uint32(len(k)))
+			out = append(out, k...)
+			if out, err = encodeValue(out, x[k]); err != nil {
+				return nil, err
+			}
+		}
+		return out, nil
+	}
+	// Fall back through reflection for named slice/map types.
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Slice, reflect.Array:
+		items := make([]any, rv.Len())
+		for i := range items {
+			items[i] = rv.Index(i).Interface()
+		}
+		return encodeValue(out, items)
+	case reflect.Map:
+		if rv.Type().Key().Kind() != reflect.String {
+			return nil, fmt.Errorf("skaidb: document keys must be strings")
+		}
+		m := make(map[string]any, rv.Len())
+		iter := rv.MapRange()
+		for iter.Next() {
+			m[iter.Key().String()] = iter.Value().Interface()
+		}
+		return encodeValue(out, m)
+	}
+	return nil, fmt.Errorf("skaidb: cannot bind value of type %T", v)
+}
+
+// errUnpreparable marks a statement kind the server declines to prepare (DDL,
+// session statements). The caller then falls back to client-side text binding.
+var errUnpreparable = fmt.Errorf("skaidb: statement cannot be prepared")
+
+// prepareServer prepares sqlText on the SERVER, returning (id, paramCount).
+// Cached per connection: a prepared id is only meaningful on the connection
+// that created it.
+func (c *conn) prepareServer(sqlText string) (uint32, int, error) {
+	if hit, ok := c.prepared[sqlText]; ok {
+		return hit.id, hit.nparams, nil
+	}
+	if c.closed {
+		return 0, 0, fmt.Errorf("skaidb: connection closed")
+	}
+	body := []byte(sqlText)
+	req := append([]byte{2}, make([]byte, 0, 4+len(body))...)
+	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
+	req = append(req, body...)
+	if err := c.writeFrame(req); err != nil {
+		return 0, 0, err
+	}
+	frame, err := c.readFrame()
+	if err != nil {
+		return 0, 0, err
+	}
+	r := &reader{buf: frame}
+	switch r.u8() {
+	case 4: // Prepared
+		id := r.u32()
+		n := int(r.u16())
+		if r.err != nil {
+			return 0, 0, r.err
+		}
+		if len(c.prepared) < 240 {
+			c.prepared[sqlText] = preparedStmt{id: id, nparams: n}
+		}
+		return id, n, nil
+	case 3: // Error
+		return 0, 0, fmt.Errorf("%w: %s", errUnpreparable, r.text())
+	}
+	return 0, 0, fmt.Errorf("skaidb: unexpected prepare response")
+}
+
+// sendPrepared executes a prepared statement with TYPED parameters.
+func (c *conn) sendPrepared(id uint32, args []driver.NamedValue) (*reader, error) {
+	if c.closed {
+		return nil, fmt.Errorf("skaidb: connection closed")
+	}
+	req := []byte{3, c.consistency}
+	req = binary.LittleEndian.AppendUint32(req, id)
+	req = binary.LittleEndian.AppendUint16(req, uint16(len(args)))
+	for _, a := range args {
+		vb, err := encodeValue(nil, a.Value)
+		if err != nil {
+			return nil, err
+		}
+		req = binary.LittleEndian.AppendUint32(req, uint32(len(vb)))
+		req = append(req, vb...)
+	}
+	if err := c.writeFrame(req); err != nil {
+		return nil, err
+	}
+	frame, err := c.readFrame()
+	if err != nil {
+		return nil, err
+	}
+	return &reader{buf: frame}, nil
 }
 
 func (c *conn) sendQuery(sqlText string) (*reader, error) {
@@ -342,6 +542,10 @@ func (c *conn) query(sqlText string) (driver.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.readRows(r)
+}
+
+func (c *conn) readRows(r *reader) (driver.Rows, error) {
 	switch tag := r.u8(); tag {
 	case 0: // Rows
 		ncols := int(r.u32())
@@ -379,6 +583,10 @@ func (c *conn) exec(sqlText string) (driver.Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.readResult(r)
+}
+
+func (c *conn) readResult(r *reader) (driver.Result, error) {
 	switch tag := r.u8(); tag {
 	case 0: // Rows returned to Exec — discard, report 0 affected
 		return result{affected: 0}, nil
@@ -519,6 +727,7 @@ func (r *reader) take(n int) []byte {
 	return b
 }
 func (r *reader) u8() byte    { return r.take(1)[0] }
+func (r *reader) u16() uint16 { return binary.LittleEndian.Uint16(r.take(2)) }
 func (r *reader) u32() uint32 { return binary.LittleEndian.Uint32(r.take(4)) }
 func (r *reader) u64() uint64 { return binary.LittleEndian.Uint64(r.take(8)) }
 func (r *reader) blob() []byte {
