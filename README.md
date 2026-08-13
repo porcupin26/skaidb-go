@@ -38,9 +38,13 @@ for rows.Next() {
 ### DSN
 
 ```
-skaidb://[user[:password]@]host[:port]/?consistency=quorum&tls_ca=/path/ca.crt
+skaidb://[user[:password]@]host[:port][,host2[:port]...][/database]?consistency=quorum&tls_ca=/path/ca.crt
 ```
 
+- Several comma-separated hosts form a **seed list**: dialled in shuffled
+  order until one connects and authenticates, and re-walked whenever
+  `database/sql` opens a replacement connection, which is how failover works.
+- A trailing `/name` selects the session database (`USE`) on every dial.
 - `port` defaults to `7000`.
 - `consistency` is `one`, `quorum` (default), or `all`.
 - Omit `user`/`password` for a server with auth disabled.
