@@ -40,6 +40,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -189,15 +190,22 @@ type conn struct {
 	nc          net.Conn
 	consistency byte
 	closed      bool
-	broken      bool
-	prepared    map[string]preparedStmt
+	// Written by the context watcher goroutine (see applyContext) while the
+	// owning goroutine may be reading it, so it is atomic.
+	broken   atomic.Bool
+	prepared map[string]preparedStmt
+	// Consistency for the statement in flight: the connection default unless
+	// a context override is set for this call (see WithConsistency).
+	// database/sql runs one statement at a time per connection, so a plain
+	// field is enough.
+	stmtLevel byte
 }
 
 // IsValid implements driver.Validator: database/sql asks before handing a
 // pooled connection out again, so a socket broken by a transport error is
 // discarded instead of failing the next caller. The replacement is dialled
 // through Open, which walks the seed list — that is where failover happens.
-func (c *conn) IsValid() bool { return !c.closed && !c.broken }
+func (c *conn) IsValid() bool { return !c.closed && !c.broken.Load() }
 
 // transportErr classifies a mid-statement I/O failure.
 //
@@ -210,7 +218,7 @@ func (c *conn) IsValid() bool { return !c.closed && !c.broken }
 // is not an upsert), so the error is surfaced to the caller instead. The
 // connection is marked broken either way.
 func (c *conn) transportErr(err error, sent bool) error {
-	c.broken = true
+	c.broken.Store(true)
 	if !sent {
 		return driver.ErrBadConn
 	}
@@ -252,7 +260,7 @@ func dialOne(cfg config, addr string) (*conn, error) {
 		}
 		nc = tc
 	}
-	c := &conn{nc: nc, consistency: cfg.consistency, prepared: map[string]preparedStmt{}}
+	c := &conn{nc: nc, consistency: cfg.consistency, stmtLevel: cfg.consistency, prepared: map[string]preparedStmt{}}
 	if err := c.handshake(cfg.user, cfg.password); err != nil {
 		nc.Close()
 		return nil, err
@@ -390,31 +398,134 @@ func WithStreaming(ctx context.Context) context.Context {
 	return context.WithValue(ctx, streamKey{}, true)
 }
 
+// consistencyKey carries a per-statement consistency override on the context.
+type consistencyKey struct{}
+
+// WithConsistency overrides the connection's consistency for the statements
+// run with this context — the per-statement control database/sql has no
+// first-class shape for. Accepts "one", "quorum" or "all" (any case).
+//
+//	rows, err := db.QueryContext(skaidb.WithConsistency(ctx, "one"), "SELECT ...")
+//
+// An unrecognised level makes the statement fail rather than silently
+// running at the connection default: a read that quietly used the wrong
+// level is worse than one that errors.
+func WithConsistency(ctx context.Context, level string) context.Context {
+	return context.WithValue(ctx, consistencyKey{}, level)
+}
+
+// consistencyFor resolves the level for one statement: the context override
+// if present, otherwise the connection's own.
+func (c *conn) consistencyFor(ctx context.Context) (byte, error) {
+	if ctx == nil {
+		return c.consistency, nil
+	}
+	v, ok := ctx.Value(consistencyKey{}).(string)
+	if !ok {
+		return c.consistency, nil
+	}
+	switch strings.ToLower(v) {
+	case "one":
+		return consistencyOne, nil
+	case "quorum":
+		return consistencyQuorum, nil
+	case "all":
+		return consistencyAll, nil
+	default:
+		return 0, fmt.Errorf("skaidb: bad consistency %q", v)
+	}
+}
+
+// applyContext wires ctx into this connection for one statement. A deadline
+// becomes a socket deadline; cancellation forces any blocked read/write to
+// return at once by setting a deadline in the past.
+//
+// An interrupted statement leaves the stream mid-frame, so the connection
+// cannot safely be reused: it is marked broken and database/sql discards it
+// (IsValid). The returned finish func clears the deadline, stops the watcher,
+// and reports ctx.Err() in place of the resulting i/o timeout, so callers can
+// test errors.Is(err, context.DeadlineExceeded) / context.Canceled as they
+// would with any other driver.
+func (c *conn) applyContext(ctx context.Context) func(error) error {
+	if ctx == nil {
+		return func(err error) error { return err }
+	}
+	if dl, ok := ctx.Deadline(); ok {
+		_ = c.nc.SetDeadline(dl)
+	}
+	if ctx.Done() == nil { // context.Background(): nothing can cancel it
+		return func(err error) error {
+			_ = c.nc.SetDeadline(time.Time{})
+			return err
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			c.broken.Store(true)
+			_ = c.nc.SetDeadline(time.Now())
+		case <-done:
+		}
+	}()
+	var once sync.Once
+	return func(err error) error {
+		once.Do(func() {
+			close(done)
+			_ = c.nc.SetDeadline(time.Time{})
+		})
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	}
+}
+
 func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	lvl, err := c.consistencyFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.stmtLevel = lvl
+	defer func() { c.stmtLevel = c.consistency }()
+	finish := c.applyContext(ctx)
 	if ctx != nil && ctx.Value(streamKey{}) != nil && len(args) == 0 {
 		rs, err := c.streamQuery(query)
 		if err == nil {
+			// A stream stays open while the caller iterates, so the deadline
+			// and the cancel watcher must outlive this call — Close ends them.
+			if r, ok := rs.(*rows); ok {
+				r.release = finish
+			}
 			return rs, nil
 		}
 		if !errors.Is(err, errNoStreaming) {
-			return nil, err
+			return nil, finish(err)
 		}
 		// fall through to the buffered path
 	}
 	if len(args) > 0 {
 		r, err := c.preparedRoundtrip(query, args)
 		if err == nil {
-			return c.readRows(r)
+			rs, err := c.readRows(r)
+			if err != nil {
+				return nil, finish(err)
+			}
+			return rs, finish(nil)
 		}
 		if !errors.Is(err, errUnpreparable) {
-			return nil, err
+			return nil, finish(err)
 		}
 	}
 	sqlText, err := bind(query, args)
 	if err != nil {
-		return nil, err
+		return nil, finish(err)
 	}
-	return c.query(sqlText)
+	rs, err := c.query(sqlText)
+	if err != nil {
+		return nil, finish(err)
+	}
+	return rs, finish(nil)
 }
 
 // preparedRoundtrip prepares (or reuses) the statement and executes it with
@@ -432,20 +543,35 @@ func (c *conn) preparedRoundtrip(query string, args []driver.NamedValue) (*reade
 }
 
 func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	lvl, err := c.consistencyFor(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.stmtLevel = lvl
+	defer func() { c.stmtLevel = c.consistency }()
+	finish := c.applyContext(ctx)
 	if len(args) > 0 {
 		r, err := c.preparedRoundtrip(query, args)
 		if err == nil {
-			return c.readResult(r)
+			res, err := c.readResult(r)
+			if err != nil {
+				return nil, finish(err)
+			}
+			return res, finish(nil)
 		}
 		if !errors.Is(err, errUnpreparable) {
-			return nil, err
+			return nil, finish(err)
 		}
 	}
 	sqlText, err := bind(query, args)
 	if err != nil {
-		return nil, err
+		return nil, finish(err)
 	}
-	return c.exec(sqlText)
+	res, err := c.exec(sqlText)
+	if err != nil {
+		return nil, finish(err)
+	}
+	return res, finish(nil)
 }
 
 // encodeValue writes v as a TYPED skaidb value (tag + payload) — the inverse
@@ -581,7 +707,7 @@ func (c *conn) sendPrepared(id uint32, args []driver.NamedValue) (*reader, error
 	if c.closed {
 		return nil, fmt.Errorf("skaidb: connection closed")
 	}
-	req := []byte{3, c.consistency}
+	req := []byte{3, c.stmtLevel}
 	req = binary.LittleEndian.AppendUint32(req, id)
 	req = binary.LittleEndian.AppendUint16(req, uint16(len(args)))
 	for _, a := range args {
@@ -608,7 +734,7 @@ func (c *conn) sendQuery(sqlText string) (*reader, error) {
 	}
 	body := []byte(sqlText)
 	req := make([]byte, 0, 6+len(body))
-	req = append(req, 1, c.consistency)
+	req = append(req, 1, c.stmtLevel)
 	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
 	req = append(req, body...)
 	if err := c.writeFrame(req); err != nil {
@@ -740,6 +866,9 @@ type rows struct {
 	// Streaming state (nil c = fully materialised, the classic path).
 	c    *conn
 	done bool
+	// Ends the statement's context watcher/deadline; set only on the
+	// streaming path, where the statement outlives QueryContext.
+	release func(error) error
 }
 
 // streamRows issues OP_QUERY_STREAM and returns rows that pull chunks from
@@ -756,7 +885,7 @@ func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
 	}
 	body := []byte(sqlText)
 	req := make([]byte, 0, 6+len(body))
-	req = append(req, 5, c.consistency) // OP_QUERY_STREAM
+	req = append(req, 5, c.stmtLevel) // OP_QUERY_STREAM
 	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
 	req = append(req, body...)
 	if err := c.writeFrame(req); err != nil {
@@ -839,7 +968,13 @@ func (r *rows) fill() error {
 }
 
 func (r *rows) Columns() []string { return r.cols }
-func (r *rows) Close() error      { return nil }
+func (r *rows) Close() error {
+	if r.release != nil {
+		r.release(nil)
+		r.release = nil
+	}
+	return nil
+}
 func (r *rows) Next(dest []driver.Value) error {
 	if r.pos >= len(r.data) {
 		if r.c == nil || r.done {
