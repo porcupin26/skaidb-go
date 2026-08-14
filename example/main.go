@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 
-	_ "github.com/porcupin26/skaidb/drivers/go"
+	_ "skaidb.org/driver/go"
 )
 
 func main() {

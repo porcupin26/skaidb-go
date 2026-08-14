@@ -1,3 +1,3 @@
-module github.com/porcupin26/skaidb/drivers/go
+module skaidb.org/driver/go
 
 go 1.21

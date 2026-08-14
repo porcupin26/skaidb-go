@@ -6,8 +6,12 @@ for its side effect and use the stdlib API you already know — `sql.Open`,
 
 ## Install
 
-```sh
-go get github.com/porcupin26/skaidb/drivers/go
+The module is distributed as a tarball, not from a public proxy — point your
+`go.mod` at the unpacked copy:
+
+```
+require skaidb.org/driver/go v0.0.0
+replace skaidb.org/driver/go => ./skaidb-driver-go
 ```
 
 ## Use
@@ -15,7 +19,7 @@ go get github.com/porcupin26/skaidb/drivers/go
 ```go
 import (
     "database/sql"
-    _ "github.com/porcupin26/skaidb/drivers/go"
+    _ "skaidb.org/driver/go"
 )
 
 db, err := sql.Open("skaidb", "skaidb://skaidb:secret@localhost:7000/?consistency=quorum")
