@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 
-	_ "skaidb.org/driver/go"
+	_ "skaidb.org/drivers/go"
 )
 
 func main() {

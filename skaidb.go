@@ -5,7 +5,7 @@
 //
 //	import (
 //		"database/sql"
-//		_ "skaidb.org/driver/go"
+//		_ "skaidb.org/drivers/go"
 //	)
 //
 //	db, _ := sql.Open("skaidb", "skaidb://user:pass@localhost:7000/?consistency=quorum")

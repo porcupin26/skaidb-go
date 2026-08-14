@@ -6,12 +6,16 @@ for its side effect and use the stdlib API you already know — `sql.Open`,
 
 ## Install
 
-The module is distributed as a tarball, not from a public proxy — point your
-`go.mod` at the unpacked copy:
+```sh
+go get skaidb.org/drivers/go
+```
+
+Offline, or to pin a vendored copy, unpack the driver tarball and point your
+`go.mod` at it instead — no network, no proxy:
 
 ```
-require skaidb.org/driver/go v0.0.0
-replace skaidb.org/driver/go => ./skaidb-driver-go
+require skaidb.org/drivers/go v0.0.0
+replace skaidb.org/drivers/go => ./skaidb-driver-go    # path to the unpacked driver
 ```
 
 ## Use
@@ -19,7 +23,7 @@ replace skaidb.org/driver/go => ./skaidb-driver-go
 ```go
 import (
     "database/sql"
-    _ "skaidb.org/driver/go"
+    _ "skaidb.org/drivers/go"
 )
 
 db, err := sql.Open("skaidb", "skaidb://skaidb:secret@localhost:7000/?consistency=quorum")
