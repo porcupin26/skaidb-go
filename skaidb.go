@@ -398,6 +398,81 @@ func WithStreaming(ctx context.Context) context.Context {
 	return context.WithValue(ctx, streamKey{}, true)
 }
 
+// Subscribe delivers a stream's events to fn as they arrive, blocking until
+// ctx is cancelled or fn returns an error.
+//
+// A dependency-free helper over the stream's log: it pages the log with the
+// keyset cursor and calls fn per event. The id is the position — keep the
+// last one and pass it as `after` to resume exactly where you stopped,
+// across restarts. Composites (k, doc) arrive as JSON text, like any other
+// document column in this driver.
+//
+// This polls; for push delivery subscribe to $stream/<db>/<name> with any
+// MQTT client instead. The events are identical.
+//
+//	err := skaidb.Subscribe(ctx, db, "big_orders", "", func(ev skaidb.Event) error {
+//		return handle(ev)
+//	})
+func Subscribe(ctx context.Context, db *sql.DB, stream, after string, fn func(Event) error) error {
+	log := "_stream_" + stream
+	cur := after
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var (
+			rows *sql.Rows
+			err  error
+		)
+		if cur == "" {
+			rows, err = db.QueryContext(ctx,
+				"SELECT id, op, k, ts, doc FROM "+log+" ORDER BY id LIMIT 500")
+		} else {
+			rows, err = db.QueryContext(ctx,
+				"SELECT id, op, k, ts, doc FROM "+log+" WHERE id > ? ORDER BY id LIMIT 500", cur)
+		}
+		if err != nil {
+			return err
+		}
+		n := 0
+		for rows.Next() {
+			var ev Event
+			if err := rows.Scan(&ev.ID, &ev.Op, &ev.Key, &ev.Ts, &ev.Doc); err != nil {
+				rows.Close()
+				return err
+			}
+			cur = ev.ID
+			n++
+			if err := fn(ev); err != nil {
+				rows.Close()
+				return err
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if n == 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+	}
+}
+
+// Event is one change captured by a stream.
+type Event struct {
+	// ID is the log position: keep the last one to resume.
+	ID  string
+	Op  string // "put" or "delete"
+	Key string // the row's primary key (JSON when composite)
+	Ts  time.Time
+	Doc string // the row document, as JSON text
+}
+
 // consistencyKey carries a per-statement consistency override on the context.
 type consistencyKey struct{}
 
