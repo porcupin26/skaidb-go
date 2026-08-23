@@ -53,6 +53,9 @@ const (
 	consistencyAll    = 2
 )
 
+// Reported in the server's drivers table via Hello.
+const driverVersion = "0.1.0"
+
 var nonceCounter uint64
 
 // ---- driver registration --------------------------------------------------
@@ -265,6 +268,7 @@ func dialOne(cfg config, addr string) (*conn, error) {
 		nc.Close()
 		return nil, err
 	}
+	c.sendHello()
 	// Session database from the DSN path (skaidb://host:port/app). USE is
 	// per-connection session state, so it must run on every dial — including
 	// the ones database/sql makes to grow the pool, which is exactly why this
@@ -276,6 +280,28 @@ func dialOne(cfg config, addr string) (*conn, error) {
 		}
 	}
 	return c, nil
+}
+
+// sendHello self-identifies best-effort: it fills the server's `drivers`
+// table client_name/client_version columns. An old server answers the
+// unknown opcode with an error frame, which is ignored — identity is
+// telemetry, never load-bearing.
+func (c *conn) sendHello() {
+	name := []byte("go")
+	ver := []byte(driverVersion)
+	req := make([]byte, 0, 1+4+len(name)+4+len(ver))
+	req = append(req, 8)
+	var l [4]byte
+	binary.LittleEndian.PutUint32(l[:], uint32(len(name)))
+	req = append(req, l[:]...)
+	req = append(req, name...)
+	binary.LittleEndian.PutUint32(l[:], uint32(len(ver)))
+	req = append(req, l[:]...)
+	req = append(req, ver...)
+	if err := c.writeFrame(req); err != nil {
+		return
+	}
+	_, _ = c.readFrame()
 }
 
 func (c *conn) writeFrame(payload []byte) error {
