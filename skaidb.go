@@ -1092,7 +1092,11 @@ func (r *rows) Next(dest []driver.Value) error {
 
 type result struct{ affected int64 }
 
-func (r result) LastInsertId() (int64, error) { return 0, fmt.Errorf("skaidb: no LastInsertId") }
+// LastInsertId is not carried on the wire: a generated id comes back as a
+// row — `db.QueryRow("INSERT INTO t (name) VALUES (?) RETURNING id", n).Scan(&id)`.
+func (r result) LastInsertId() (int64, error) {
+	return 0, fmt.Errorf("skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow")
+}
 func (r result) RowsAffected() (int64, error) { return r.affected, nil }
 
 // ---- value decoding (§4) ---------------------------------------------------
