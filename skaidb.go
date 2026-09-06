@@ -901,6 +901,34 @@ func (c *conn) readRows(r *reader) (driver.Rows, error) {
 			return nil, r.err
 		}
 		return &rows{cols: cols, data: data}, nil
+	case 8: // ResultSets: a CALL whose body EMITted — first set current
+		n := int(r.u32())
+		sets := make([]resultSet, 0, n)
+		for s := 0; s < n; s++ {
+			ncols := int(r.u32())
+			cols := make([]string, ncols)
+			for i := range cols {
+				cols[i] = r.text()
+			}
+			nrows := int(r.u32())
+			data := make([][]driver.Value, nrows)
+			for i := 0; i < nrows; i++ {
+				ncells := int(r.u32())
+				row := make([]driver.Value, ncells)
+				for j := 0; j < ncells; j++ {
+					row[j] = decodeValue(&reader{buf: r.blob()})
+				}
+				data[i] = row
+			}
+			sets = append(sets, resultSet{cols: cols, data: data})
+		}
+		if r.err != nil {
+			return nil, r.err
+		}
+		if len(sets) == 0 {
+			return &rows{cols: []string{}, data: nil}, nil
+		}
+		return &rows{cols: sets[0].cols, data: sets[0].data, more: sets[1:]}, nil
 	case 1: // Mutation: a SELECT-less result; surface an empty row set
 		return &rows{cols: []string{}, data: nil}, nil
 	case 2: // Ddl
@@ -964,6 +992,9 @@ type rows struct {
 	cols []string
 	data [][]driver.Value
 	pos  int
+	// Further result sets of a multi-set reply (a CALL whose body EMITs),
+	// served through database/sql's NextResultSet.
+	more []resultSet
 	// Streaming state (nil c = fully materialised, the classic path).
 	c    *conn
 	done bool
@@ -1066,6 +1097,27 @@ func (r *rows) fill() error {
 			return fmt.Errorf("skaidb: unexpected frame in stream")
 		}
 	}
+}
+
+// One decoded result set of a multi-set reply.
+type resultSet struct {
+	cols []string
+	data [][]driver.Value
+}
+
+// HasNextResultSet reports whether a further result set follows
+// (driver.RowsNextResultSet).
+func (r *rows) HasNextResultSet() bool { return len(r.more) > 0 }
+
+// NextResultSet advances to the next result set of a multi-set reply.
+func (r *rows) NextResultSet() error {
+	if len(r.more) == 0 {
+		return io.EOF
+	}
+	next := r.more[0]
+	r.more = r.more[1:]
+	r.cols, r.data, r.pos = next.cols, next.data, 0
+	return nil
 }
 
 func (r *rows) Columns() []string { return r.cols }
