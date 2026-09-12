@@ -197,6 +197,18 @@ type conn struct {
 	// owning goroutine may be reading it, so it is atomic.
 	broken   atomic.Bool
 	prepared map[string]preparedStmt
+	// True from a streamed result set's RowsHeader until its rows are closed.
+	// PROTOCOL.md §3.4: the connection is busy for the whole stream, so no
+	// other request may be sent on it until RowsEnd or Error.
+	//
+	// A flag that rejects the second caller rather than a mutex held for the
+	// stream's duration: database/sql lets two goroutines share one *sql.Conn
+	// and takes its per-connection lock per CALL, not per stream, so a mutex
+	// here would simply park the second goroutine until the rows were closed
+	// — forever, if their owner never closes them. Interleaving two
+	// statements on one socket is a programming error, and an error names it;
+	// a deadlock does not. Atomic because those two goroutines are the point.
+	streaming atomic.Bool
 	// Consistency for the statement in flight: the connection default unless
 	// a context override is set for this call (see WithConsistency).
 	// database/sql runs one statement at a time per connection, so a plain
@@ -420,6 +432,13 @@ type streamKey struct{}
 // Parameters are not supported on this path — the streaming opcode carries
 // SQL text, so bind values yourself or use a parameterless statement. Falls
 // back to a buffered query against a server too old to know the opcode.
+//
+// The rows own the connection until they are closed: another statement on the
+// same *sql.Conn fails with a "busy streaming" error until then. Always close
+// them — database/sql runs Close for you on an early break out of the
+// iteration, and that is where an unfinished stream is made safe: the rest of
+// it is drained when that is cheap, and the connection is retired when it is
+// not, so the pool never hands a half-read stream to the next caller.
 func WithStreaming(ctx context.Context) context.Context {
 	return context.WithValue(ctx, streamKey{}, true)
 }
@@ -774,6 +793,9 @@ func (c *conn) prepareServer(sqlText string) (uint32, int, error) {
 	if c.closed {
 		return 0, 0, fmt.Errorf("skaidb: connection closed")
 	}
+	if c.streaming.Load() {
+		return 0, 0, errStreamBusy
+	}
 	body := []byte(sqlText)
 	req := append([]byte{2}, make([]byte, 0, 4+len(body))...)
 	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
@@ -808,6 +830,9 @@ func (c *conn) sendPrepared(id uint32, args []driver.NamedValue) (*reader, error
 	if c.closed {
 		return nil, fmt.Errorf("skaidb: connection closed")
 	}
+	if c.streaming.Load() {
+		return nil, errStreamBusy
+	}
 	req := []byte{3, c.stmtLevel}
 	req = binary.LittleEndian.AppendUint32(req, id)
 	req = binary.LittleEndian.AppendUint16(req, uint16(len(args)))
@@ -832,6 +857,9 @@ func (c *conn) sendPrepared(id uint32, args []driver.NamedValue) (*reader, error
 func (c *conn) sendQuery(sqlText string) (*reader, error) {
 	if c.closed {
 		return nil, fmt.Errorf("skaidb: connection closed")
+	}
+	if c.streaming.Load() {
+		return nil, errStreamBusy
 	}
 	body := []byte(sqlText)
 	req := make([]byte, 0, 6+len(body))
@@ -1015,6 +1043,9 @@ func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
 	if c.closed {
 		return nil, fmt.Errorf("skaidb: connection closed")
 	}
+	if c.streaming.Load() {
+		return nil, errStreamBusy
+	}
 	body := []byte(sqlText)
 	req := make([]byte, 0, 6+len(body))
 	req = append(req, 5, c.stmtLevel) // OP_QUERY_STREAM
@@ -1036,8 +1067,13 @@ func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
 			cols[i] = r.text()
 		}
 		if r.err != nil {
+			// A truncated header leaves the chunks behind it unread and no
+			// way to tell where the next frame starts.
+			c.broken.Store(true)
 			return nil, r.err
 		}
+		// Busy until RowsEnd or Error; rows.Close hands the socket back.
+		c.streaming.Store(true)
 		return &rows{cols: cols, c: c}, nil
 	case 0: // Rows — server chose to answer in one frame
 		return c.readRowsBody(r)
@@ -1056,12 +1092,33 @@ func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
 // errNoStreaming marks a server too old to know OP_QUERY_STREAM.
 var errNoStreaming = fmt.Errorf("skaidb: server does not support streaming")
 
+// errStreamBusy rejects a statement issued while a streamed result set is
+// still in flight on the same connection. Replies come back in request order,
+// so a second request here would be answered with the stream's next chunk
+// while the stream's RowsEnd went to the second caller's decoder — two
+// silently wrong answers. Failing the newcomer is the only outcome that
+// reports the mistake to whoever made it.
+var errStreamBusy = errors.New("skaidb: connection is busy streaming a result set — close those rows before running another statement")
+
+// Bounds on the drain of an abandoned stream (rows.abandon). Swallowing the
+// tail of a page or two is cheap and keeps a pooled connection alive; the
+// tail of a million-row scan is neither, and the caller has already said it
+// does not want those rows.
+const (
+	drainMaxFrames = 64
+	drainMaxBytes  = 8 << 20
+)
+
+// drainTimeout caps how long Close waits on a peer that has gone quiet
+// mid-stream. A var so the tests can shorten it.
+var drainTimeout = 2 * time.Second
+
 // fill pulls the next chunk. io.EOF once RowsEnd arrives.
 func (r *rows) fill() error {
 	for {
 		frame, err := r.c.readFrame()
 		if err != nil {
-			r.done = true
+			r.endStream()
 			return r.c.transportErr(err, true)
 		}
 		rd := &reader{buf: frame}
@@ -1081,19 +1138,25 @@ func (r *rows) fill() error {
 				data[i] = row
 			}
 			if rd.err != nil {
-				r.done = true
+				// Half a chunk decoded: the frame boundary is still good, but
+				// the rest of the stream is not ours to interpret any more.
+				r.endStream()
+				r.c.broken.Store(true)
 				return rd.err
 			}
 			r.data, r.pos = data, 0
 			return nil
 		case 7: // RowsEnd
-			r.done = true
+			r.endStream()
 			return io.EOF
-		case 3: // Error mid-stream: rows already delivered stay valid
-			r.done = true
+		case 3:
+			// An Error ends the stream: the rows already delivered stay
+			// valid, and the socket is back at a frame boundary.
+			r.endStream()
 			return fmt.Errorf("skaidb: %s", rd.text())
 		default:
-			r.done = true
+			r.endStream()
+			r.c.broken.Store(true)
 			return fmt.Errorf("skaidb: unexpected frame in stream")
 		}
 	}
@@ -1121,7 +1184,74 @@ func (r *rows) NextResultSet() error {
 }
 
 func (r *rows) Columns() []string { return r.cols }
+
+// endStream marks the exchange over and frees the connection for the next
+// statement. Every path that reaches a frame boundary calls it, and so does
+// Close — the only one database/sql guarantees to run.
+func (r *rows) endStream() {
+	r.done = true
+	if r.c != nil {
+		r.c.streaming.Store(false)
+	}
+}
+
+// abandon puts the socket back on a request boundary after the caller walked
+// away from a stream mid-flight — an early break, a Scan error, a cancelled
+// context. The unread RowsChunk/RowsEnd frames are still queued, and
+// database/sql hands the connection straight to the next caller, who would
+// decode a leftover chunk as the answer to its own statement (surfacing, if
+// it is lucky enough to fail at all, as "unknown response tag 6").
+//
+// PROTOCOL.md §3.4 allows either remedy: drain the rest, or stop using the
+// connection. This drains within drainMaxFrames/drainMaxBytes/drainTimeout
+// and otherwise retires the connection, which fails IsValid — the pool health
+// check database/sql runs before reuse — so the socket is closed rather than
+// handed to the next caller. driver.ErrBadConn is not the tool here: it asks
+// database/sql to RETRY a statement elsewhere, and there is nothing to retry.
+//
+// Both outcomes are correct and neither is the caller's fault, so neither is
+// reported as an error.
+func (r *rows) abandon() {
+	if r.c.closed || r.c.broken.Load() {
+		return // nothing to drain from a socket already on its way out
+	}
+	// A peer that stops talking mid-stream must not block Close forever.
+	_ = r.c.nc.SetReadDeadline(time.Now().Add(drainTimeout))
+	defer func() { _ = r.c.nc.SetReadDeadline(time.Time{}) }()
+	budget := drainMaxBytes
+	for i := 0; i < drainMaxFrames; i++ {
+		frame, err := r.c.readFrame()
+		if err != nil {
+			r.c.broken.Store(true)
+			return
+		}
+		budget -= len(frame)
+		switch (&reader{buf: frame}).u8() {
+		case 7, 3: // RowsEnd, or an Error ending the stream early
+			return
+		case 6: // RowsChunk: discarded unparsed, only its size matters here
+			if budget < 0 {
+				r.c.broken.Store(true)
+				return
+			}
+		default:
+			// Not a stream frame at all, so the connection was already out of
+			// step; there is nothing to resynchronise to.
+			r.c.broken.Store(true)
+			return
+		}
+	}
+	r.c.broken.Store(true)
+}
+
+// Close ends the result set. database/sql calls it on every exit from a Rows
+// — including an early break out of the loop and a cancelled context — which
+// makes it the hook where an abandoned stream is made safe (see abandon).
 func (r *rows) Close() error {
+	if r.c != nil && !r.done {
+		r.abandon()
+	}
+	r.endStream()
 	if r.release != nil {
 		r.release(nil)
 		r.release = nil
