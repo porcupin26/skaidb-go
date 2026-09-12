@@ -434,11 +434,16 @@ type streamKey struct{}
 // back to a buffered query against a server too old to know the opcode.
 //
 // The rows own the connection until they are closed: another statement on the
-// same *sql.Conn fails with a "busy streaming" error until then. Always close
-// them — database/sql runs Close for you on an early break out of the
-// iteration, and that is where an unfinished stream is made safe: the rest of
-// it is drained when that is cheap, and the connection is retired when it is
-// not, so the pool never hands a half-read stream to the next caller.
+// same *sql.Conn fails with a "busy streaming" error until then.
+//
+// ALWAYS `defer rows.Close()`. database/sql closes a Rows for you when the
+// iteration runs to the end or the context is cancelled — but NOT on a bare
+// `break` out of the loop, and there is no finalizer, so a dropped Rows is
+// never closed at all. Close is where an unfinished stream is made safe: the
+// rest of it is drained when that is cheap, the connection is retired when it
+// is not, and the pool never hands a half-read stream to the next caller.
+// Skip the defer and break early, and the connection stays checked out,
+// streaming, until the process ends.
 func WithStreaming(ctx context.Context) context.Context {
 	return context.WithValue(ctx, streamKey{}, true)
 }
@@ -596,6 +601,20 @@ func (c *conn) applyContext(ctx context.Context) func(error) error {
 		})
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
+		}
+		// The socket deadline above and the context's own timer are two
+		// independent clocks set to the same instant, and the read observes
+		// its one first often enough to matter: `ctx.Err()` is still nil
+		// while the connection has already failed with a timeout. Reporting
+		// the raw i/o error there breaks the promise this function exists to
+		// keep — `errors.Is(err, context.DeadlineExceeded)` came back false
+		// on roughly one deadline in twenty. If the deadline has passed and
+		// the error is the timeout it caused, name it for what it is.
+		if dl, ok := ctx.Deadline(); ok && !time.Now().Before(dl) {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				return context.DeadlineExceeded
+			}
 		}
 		return err
 	}
@@ -1187,7 +1206,8 @@ func (r *rows) Columns() []string { return r.cols }
 
 // endStream marks the exchange over and frees the connection for the next
 // statement. Every path that reaches a frame boundary calls it, and so does
-// Close — the only one database/sql guarantees to run.
+// Close — which database/sql runs on exhaustion and on a cancelled context,
+// but not on a bare `break`.
 func (r *rows) endStream() {
 	r.done = true
 	if r.c != nil {
@@ -1244,9 +1264,13 @@ func (r *rows) abandon() {
 	r.c.broken.Store(true)
 }
 
-// Close ends the result set. database/sql calls it on every exit from a Rows
-// — including an early break out of the loop and a cancelled context — which
-// makes it the hook where an abandoned stream is made safe (see abandon).
+// Close ends the result set, and is the hook where an abandoned stream is made
+// safe (see abandon).
+//
+// database/sql calls it when the iteration is exhausted and when the context
+// is cancelled — but NOT on a bare `break`, and never from a finalizer. So
+// this runs on an abandoned stream only because the caller wrote
+// `defer rows.Close()`, which is why the package doc insists on it.
 func (r *rows) Close() error {
 	if r.c != nil && !r.done {
 		r.abandon()
