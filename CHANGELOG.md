@@ -4,6 +4,26 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.0.1] — 2026-09-19
+
+### Fixed
+- A malformed DSN (`consistency=eventual`, `tls=maybe`, a non-numeric port,
+  a bad scheme, no host) now fails `sql.Open` itself, as documented. The
+  driver only implemented `driver.Driver`, so `database/sql` never parsed
+  the DSN until the first connection and the error surfaced on the first
+  statement or `Ping` instead. The driver now implements
+  `driver.DriverContext`: `OpenConnector` parses eagerly and hands
+  `database/sql` a `driver.Connector` that dials the seed list per pooled
+  connection. Well-formed DSNs still open lazily; `db.Driver()` is
+  unchanged; `Open(dsn)` on the driver value keeps its parse-and-dial
+  behaviour.
+
+### Added
+- Unit tests for `OpenConnector` (every malformed-DSN case through
+  `sql.Open`, the parsed configuration it keeps) and `Connector.Connect`
+  (a scripted handshake, Hello and `USE` over a loopback server; a
+  cancelled context; unreachable seeds).
+
 ## [1.0.0] — 2026-09-19
 
 The first release from its own repository. The driver previously shipped

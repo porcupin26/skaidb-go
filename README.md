@@ -66,8 +66,8 @@ receives no further releases. Switch your imports:
 
 then `go get github.com/porcupin26/skaidb-go@latest && go mod tidy`. The
 registered driver name (`"skaidb"`), the DSN and the API are unchanged; the
-1.0.0 [changelog](CHANGELOG.md) lists the two DSN fixes and the version
-reporting change.
+[changelog](CHANGELOG.md) lists the DSN fixes and the version reporting
+change.
 
 ### Vendoring / offline
 
@@ -75,7 +75,7 @@ The module is a single package with no dependencies. `go mod vendor` works
 as usual; or point a `replace` at a checkout:
 
 ```
-require github.com/porcupin26/skaidb-go v1.0.0
+require github.com/porcupin26/skaidb-go v1.0.1
 replace github.com/porcupin26/skaidb-go => ../skaidb-go
 ```
 
@@ -155,7 +155,9 @@ skaidb://[user[:password]@]host[:port][,host2[:port]...][/database][?option=valu
 | `tls_server_name` | SNI and the name checked against the certificate's SANs. skaidb's own certificates carry `DNS:skaidb`, so the default is right for them and is usually *not* the address you dialled. | `skaidb` |
 
 Unknown options are ignored; a malformed value (`consistency=eventual`,
-`tls=maybe`, a non-numeric port) makes `sql.Open` fail immediately.
+`tls=maybe`, a non-numeric port) makes `sql.Open` itself return the error —
+the driver implements `driver.DriverContext`, so the DSN is parsed when the
+`*sql.DB` is created, before anything is dialled.
 
 ### Seeds and failover
 
@@ -278,7 +280,8 @@ For the curious, and for anyone using `driver` types directly:
 
 | Interface | Notes |
 |---|---|
-| `driver.Driver` | `Open(dsn)` parses the DSN and dials |
+| `driver.Driver`, `driver.DriverContext` | `OpenConnector(dsn)` parses the DSN at `sql.Open` (a malformed DSN fails there, nothing is dialled); `Open(dsn)` parses and dials, for code that holds the driver value directly |
+| `driver.Connector` | one seed-list dial per pooled connection; `db.Driver()` returns the registered driver |
 | `driver.Conn` | `Prepare`, `Close`; `Begin` returns an error (no transactions) |
 | `driver.Validator` | retires connections broken mid-statement before the pool reuses them |
 | `driver.NamedValueChecker` | accepts any Go value so slices and maps can reach the typed path |

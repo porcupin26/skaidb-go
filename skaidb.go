@@ -109,6 +109,9 @@ var nonceCounter uint64
 
 type drv struct{}
 
+// Open implements driver.Driver: parse, then dial. database/sql prefers
+// OpenConnector (driver.DriverContext) and only calls this on a driver
+// that lacks it; it stays for callers that use the driver value directly.
 func (d *drv) Open(dsn string) (driver.Conn, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
@@ -116,6 +119,39 @@ func (d *drv) Open(dsn string) (driver.Conn, error) {
 	}
 	return dial(cfg)
 }
+
+// OpenConnector implements driver.DriverContext. sql.Open calls it once,
+// so the DSN is parsed eagerly and a malformed one fails sql.Open itself
+// rather than the first statement; nothing is dialled here. The returned
+// connector is what the pool dials through from then on.
+func (d *drv) OpenConnector(dsn string) (driver.Connector, error) {
+	cfg, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &connector{cfg: cfg, d: d}, nil
+}
+
+// connector is the driver.Connector database/sql holds for the life of a
+// *sql.DB: the parsed DSN plus the driver that produced it.
+type connector struct {
+	cfg config
+	d   *drv
+}
+
+// Connect implements driver.Connector: one seed-list dial per pooled
+// connection. The dial itself has a fixed connect timeout and is not
+// interruptible mid-handshake, so ctx only short-circuits an attempt that
+// is already cancelled when the pool asks.
+func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return dial(c.cfg)
+}
+
+// Driver implements driver.Connector; it is what db.Driver() returns.
+func (c *connector) Driver() driver.Driver { return c.d }
 
 type config struct {
 	addrs       []string
