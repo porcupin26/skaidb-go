@@ -1,0 +1,17 @@
+# build products
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+
+# editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# never publish local secrets or LLM/agent state
+.env
+.priv/
+.claude/

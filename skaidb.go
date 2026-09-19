@@ -5,7 +5,7 @@
 //
 //	import (
 //		"database/sql"
-//		_ "skaidb.org/drivers/go"
+//		_ "github.com/porcupin26/skaidb-go"
 //	)
 //
 //	db, _ := sql.Open("skaidb", "skaidb://user:pass@localhost:7000/?consistency=quorum")
@@ -37,6 +37,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,8 +54,54 @@ const (
 	consistencyAll    = 2
 )
 
-// Reported in the server's drivers table via Hello.
-const driverVersion = "0.1.0"
+// modulePath is this module's import path, the key under which the Go
+// toolchain records the version it built.
+const modulePath = "github.com/porcupin26/skaidb-go"
+
+// driverVersion is what Hello reports to the server (its `drivers` table).
+// Derived from the build metadata so it always equals the module version the
+// program was built against — never a literal that goes stale.
+var driverVersion = versionFromBuildInfo(debug.ReadBuildInfo())
+
+// Version returns the driver's own version as the server sees it in Hello:
+// the module version this program was built against ("1.0.0" for v1.0.0,
+// a pseudo-version for an untagged commit), or "devel" when the driver is
+// the main module or the build carries no module metadata.
+func Version() string { return driverVersion }
+
+// versionFromBuildInfo resolves the module version from the toolchain's
+// embedded build info: the main module when this package IS the program
+// (its own tests, a checkout built directly), otherwise the dependency
+// entry, honouring a `replace`. The leading "v" is dropped so the wire
+// value matches the other drivers ("1.0.0"), and the toolchain's "(devel)"
+// placeholder becomes "devel".
+func versionFromBuildInfo(bi *debug.BuildInfo, ok bool) string {
+	if !ok || bi == nil {
+		return "devel"
+	}
+	var m *debug.Module
+	if bi.Main.Path == modulePath {
+		m = &bi.Main
+	} else {
+		for _, d := range bi.Deps {
+			if d.Path == modulePath {
+				m = d
+				break
+			}
+		}
+	}
+	if m == nil {
+		return "devel"
+	}
+	if m.Replace != nil {
+		m = m.Replace
+	}
+	v := strings.TrimPrefix(m.Version, "v")
+	if v == "" || v == "(devel)" {
+		return "devel"
+	}
+	return v
+}
 
 var nonceCounter uint64
 
@@ -83,12 +130,26 @@ type config struct {
 }
 
 func parseDSN(dsn string) (config, error) {
-	u, err := url.Parse(dsn)
+	// The authority is split by hand: net/url validates the port of ONE
+	// host, so a seed list such as `h1,h2:7001,h3` (last seed without a
+	// port) fails its parse with "invalid port". Everything after the
+	// authority — path and query — is still url.Parse's job, as is the
+	// percent-decoding of the credentials.
+	rest, ok := strings.CutPrefix(dsn, "skaidb://")
+	if !ok {
+		return config{}, fmt.Errorf("skaidb: DSN scheme must be skaidb://")
+	}
+	authority, tail := rest, ""
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		authority, tail = rest[:i], rest[i:]
+	}
+	hostPart, userinfo := authority, ""
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		userinfo, hostPart = authority[:at]+"@", authority[at+1:]
+	}
+	u, err := url.Parse("skaidb://" + userinfo + "seeds" + tail)
 	if err != nil {
 		return config{}, fmt.Errorf("skaidb: bad DSN: %w", err)
-	}
-	if u.Scheme != "skaidb" {
-		return config{}, fmt.Errorf("skaidb: DSN scheme must be skaidb://")
 	}
 	cfg := config{user: "anonymous", consistency: consistencyQuorum}
 	if u.User != nil {
@@ -100,13 +161,14 @@ func parseDSN(dsn string) (config, error) {
 	// Seeds: skaidb://user:pass@host1:7000,host2:7000,host3/db . skaidb is
 	// leaderless, so any node serves — a seed list is just "somewhere to
 	// land", with no primary to discover.
-	for _, h := range strings.Split(u.Host, ",") {
+	for _, h := range strings.Split(hostPart, ",") {
 		h = strings.TrimSpace(h)
 		if h == "" {
 			continue
 		}
-		if !strings.Contains(h, ":") {
-			h += ":7000"
+		h, err := withDefaultPort(h)
+		if err != nil {
+			return config{}, err
 		}
 		cfg.addrs = append(cfg.addrs, h)
 	}
@@ -152,6 +214,30 @@ func parseDSN(dsn string) (config, error) {
 		cfg.tlsName = "skaidb"
 	}
 	return cfg, nil
+}
+
+// withDefaultPort appends :7000 to a seed that names no port. A bracketed
+// IPv6 literal ("[::1]") has a port only after its closing bracket.
+func withDefaultPort(h string) (string, error) {
+	hasPort := strings.Contains(h, ":")
+	if strings.HasPrefix(h, "[") {
+		end := strings.Index(h, "]")
+		if end < 0 {
+			return "", fmt.Errorf("skaidb: bad seed %q", h)
+		}
+		hasPort = strings.HasPrefix(h[end+1:], ":")
+	}
+	if !hasPort {
+		h += ":7000"
+	}
+	host, port, err := net.SplitHostPort(h)
+	if err != nil {
+		return "", fmt.Errorf("skaidb: bad seed %q: %w", h, err)
+	}
+	if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 || host == "" {
+		return "", fmt.Errorf("skaidb: bad seed %q", h)
+	}
+	return h, nil
 }
 
 // tlsWrap upgrades an established TCP connection to TLS and completes the
@@ -415,10 +501,48 @@ func (c *conn) Begin() (driver.Tx, error) {
 	return nil, fmt.Errorf("skaidb: transactions are not supported")
 }
 
-// CheckNamedValue accepts ANY Go value. Without it database/sql pre-converts
-// arguments to its own small driver.Value set and rejects slices and maps
-// outright, so an array or a document could never reach the wire.
-func (c *conn) CheckNamedValue(nv *driver.NamedValue) error { return nil }
+// CheckNamedValue decides how an argument reaches the wire. database/sql's
+// default converter reduces every argument to its small driver.Value set
+// (int64, float64, bool, []byte, string, time.Time, nil) — and rejects
+// slices and maps outright, so an array or a document could never be bound.
+// Composites are therefore accepted here as they are, for the typed path to
+// encode. Everything else is handed back with driver.ErrSkip so the default
+// converter still runs: that is what turns a uint8 or a named int into an
+// int64, dereferences pointers, and calls driver.Valuer (sql.NullString and
+// friends). A Valuer is unwrapped first so that one returning a slice or a
+// map is bound as a composite rather than refused as a "non-Value".
+func (c *conn) CheckNamedValue(nv *driver.NamedValue) error {
+	if vr, ok := nv.Value.(driver.Valuer); ok {
+		v, err := vr.Value()
+		if err != nil {
+			return err
+		}
+		nv.Value = v
+	}
+	if isComposite(nv.Value) {
+		return nil
+	}
+	return driver.ErrSkip
+}
+
+// isComposite reports whether v binds as an Array or a Document: any slice
+// or array other than a byte slice, or any map — through pointers.
+func isComposite(v any) bool {
+	rv := reflect.ValueOf(v)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return false
+		}
+		rv = rv.Elem()
+	}
+	switch rv.Kind() {
+	case reflect.Slice:
+		return rv.Type().Elem().Kind() != reflect.Uint8
+	case reflect.Array, reflect.Map:
+		return true
+	}
+	return false
+}
 
 // streamKey marks a context as requesting streamed delivery.
 type streamKey struct{}
@@ -517,7 +641,7 @@ func Subscribe(ctx context.Context, db *sql.DB, stream, after string, fn func(Ev
 type Event struct {
 	// ID is the log position: keep the last one to resume.
 	ID  string
-	Op  string // "put" or "delete"
+	Op  string // "put" (matches now), "exit" (matched before, no longer does) or "delete"
 	Key string // the row's primary key (JSON when composite)
 	Ts  time.Time
 	Doc string // the row document, as JSON text
@@ -775,10 +899,41 @@ func encodeValue(out []byte, v any) ([]byte, error) {
 		}
 		return out, nil
 	}
-	// Fall back through reflection for named slice/map types.
+	// Composite elements do not pass through database/sql's converter, so
+	// the normalisation it does for top-level scalars is repeated here:
+	// Valuers, pointers, and every integer/float/bool/string kind (named
+	// types included) reduce to the cases above.
+	if vr, ok := v.(driver.Valuer); ok {
+		dv, err := vr.Value()
+		if err != nil {
+			return nil, err
+		}
+		return encodeValue(out, dv)
+	}
 	rv := reflect.ValueOf(v)
 	switch rv.Kind() {
+	case reflect.Bool:
+		return encodeValue(out, rv.Bool())
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return encodeValue(out, rv.Int())
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if rv.Uint() > math.MaxInt64 {
+			return nil, fmt.Errorf("skaidb: cannot bind %d: exceeds the Int range", rv.Uint())
+		}
+		return encodeValue(out, int64(rv.Uint()))
+	case reflect.Float32, reflect.Float64:
+		return encodeValue(out, rv.Float())
+	case reflect.String:
+		return encodeValue(out, rv.String())
+	case reflect.Pointer:
+		if rv.IsNil() {
+			return append(out, 0), nil
+		}
+		return encodeValue(out, rv.Elem().Interface())
 	case reflect.Slice, reflect.Array:
+		if rv.Kind() == reflect.Slice && rv.Type().Elem().Kind() == reflect.Uint8 {
+			return encodeValue(out, rv.Bytes()) // a named byte slice (json.RawMessage) is Bytes
+		}
 		items := make([]any, rv.Len())
 		for i := range items {
 			items[i] = rv.Index(i).Interface()
@@ -1020,6 +1175,24 @@ type stmt struct {
 
 func (s *stmt) Close() error  { return nil }
 func (s *stmt) NumInput() int { return s.n }
+
+// QueryContext / ExecContext (driver.StmtQueryContext / StmtExecContext) are
+// what database/sql calls for a *sql.Stmt. They take the same path as a
+// direct db.Query/db.Exec with arguments: the statement is prepared on the
+// server (once per pooled connection, by text) and run with TYPED
+// parameters, so arrays and documents bind through a *sql.Stmt exactly as
+// they do through db.Exec — and the context's deadline, cancellation and
+// WithConsistency override apply.
+func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	return s.c.QueryContext(ctx, s.query, args)
+}
+func (s *stmt) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	return s.c.ExecContext(ctx, s.query, args)
+}
+
+// Query / Exec are the legacy driver.Stmt entry points; database/sql only
+// reaches them when the Context variants above are missing, so in practice
+// they are never called. Kept for the interface, on the client-side text path.
 func (s *stmt) Query(args []driver.Value) (driver.Rows, error) {
 	sqlText, err := bind(s.query, named(args))
 	if err != nil {

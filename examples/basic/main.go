@@ -1,4 +1,4 @@
-// Runnable example: go run . "skaidb://user:pass@host:7000/?consistency=quorum"
+// Basic usage: go run ./examples/basic "skaidb://user:pass@host:7000/?consistency=quorum"
 package main
 
 import (
@@ -7,7 +7,7 @@ import (
 	"log"
 	"os"
 
-	_ "skaidb.org/drivers/go"
+	_ "github.com/porcupin26/skaidb-go"
 )
 
 func main() {
