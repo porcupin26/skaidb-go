@@ -674,4 +674,10 @@ version constant to bump and no registry credential: a Go module is
 published by its tag. Never move or delete a pushed tag — the proxy and the
 checksum database keep it forever.
 
+Do not ask the proxy for a version before its tag is pushed — no
+`go get …@vX.Y.Z`, no `curl` of `@v/vX.Y.Z.info`. proxy.golang.org caches the
+miss, and until that entry expires everyone (the workflow included) gets
+`unknown revision vX.Y.Z`. The workflow retries for about 35 minutes; past
+that, re-run it after the entry has expired rather than re-tagging.
+
 License: [SSPL-1.0](LICENSE).

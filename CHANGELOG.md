@@ -4,6 +4,16 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.0.3] — 2026-09-20
+
+### Fixed
+- Release automation: the workflow warms proxy.golang.org with a real
+  download (`go mod download` by tag, after resolving the tagged commit) and
+  waits out a cached miss instead of failing on the first 404; `go list -m`
+  prints a canonical version without contacting the proxy, so the 1.0.2 run
+  warmed nothing and then tripped over a miss cached before the tag existed.
+  No driver code changed.
+
 ## [1.0.2] — 2026-09-20
 
 ### Changed

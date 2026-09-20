@@ -27,6 +27,7 @@ jobs:
   release:
     name: release ${{ github.ref_name }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -132,20 +133,39 @@ jobs:
         run: |
           set -euo pipefail
           TAG="$GITHUB_REF_NAME"
+          SHA="$(git rev-parse "$TAG^{commit}")"
           scratch="$(mktemp -d)"; cd "$scratch"
           go mod init tmp >/dev/null 2>&1
-          # The proxy fetches a brand-new tag from GitHub on its first request;
-          # allow it a few tries before calling the tag unpublished.
-          for i in $(seq 1 12); do
-            if out="$(go list -m "$MODULE@$TAG" 2>&1)"; then echo "$out"; break; fi
-            echo "attempt $i: $out"
-            if [ "$i" -eq 12 ]; then echo "::error::proxy.golang.org never served $MODULE@$TAG"; exit 1; fi
-            sleep 10
+          # Resolving the commit makes the proxy fetch the repository and map the
+          # commit to its tag. Nobody can ask for a commit before it exists, so
+          # this lookup is never a cached miss; it also refreshes @v/list.
+          echo "--- https://proxy.golang.org/$MODULE/@v/$SHA.info ---"
+          curl -sS "https://proxy.golang.org/$MODULE/@v/$SHA.info" || true; echo
+          # Now fetch by tag — .info, .mod and .zip through the proxy, verified
+          # against sum.golang.org, which records the version as a side effect.
+          # (`go list -m` prints a canonical version without contacting the
+          # proxy, so it warms nothing.) proxy.golang.org caches a miss: if this
+          # version was requested before the tag was pushed, it answers
+          # "unknown revision" until that entry expires, so keep asking.
+          for i in $(seq 1 70); do
+            if go mod download -json "$MODULE@$TAG" > download.json 2>&1 && ! grep -q '"Error"' download.json; then
+              cat download.json
+              break
+            fi
+            echo "attempt $i/70 at $(date -u +%H:%M:%SZ): $(tr -d '\n' < download.json | cut -c1-300)"
+            if [ "$i" -eq 70 ]; then
+              echo "::error::proxy.golang.org still does not serve $MODULE@$TAG. If this version was requested from the proxy before the tag existed, the proxy cached that miss: wait for it to expire and re-run this workflow (the GitHub Release step is idempotent). Never re-tag."
+              exit 1
+            fi
+            sleep 30
           done
           echo "--- https://proxy.golang.org/$MODULE/@v/$TAG.info ---"
           curl -fsS "https://proxy.golang.org/$MODULE/@v/$TAG.info"; echo
           echo "--- https://proxy.golang.org/$MODULE/@v/list ---"
-          curl -fsS "https://proxy.golang.org/$MODULE/@v/list"
+          curl -fsS "https://proxy.golang.org/$MODULE/@v/list" | tee list.txt
+          if ! grep -qx "$TAG" list.txt; then
+            echo "::warning::@v/list does not show $TAG yet; that endpoint is cached and catches up by itself"
+          fi
 
       - name: Verify the published module reports the tag
         env:
