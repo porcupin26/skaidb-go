@@ -40,6 +40,7 @@ db, err := sql.Open("skaidb", "skaidb://skaidb:secret@localhost:7000/app?consist
 13. [Errors](#errors)
 14. [Versioning and compatibility](#versioning-and-compatibility)
 15. [Development](#development)
+16. [Releasing](#releasing)
 
 Further reading: [server documentation](https://skaidb.org/docs/) ·
 [wire protocol](https://skaidb.org/docs/PROTOCOL.html) ·
@@ -654,5 +655,23 @@ go vet ./... && go test -race ./...
 The tests need no server: they drive the connection against scripted
 loopback peers. `examples/` builds with `go build ./...` and runs against a
 live server. Pull requests run the same on the CI matrix.
+
+## Releasing
+
+A release is a tag. Add a `## [X.Y.Z] — YYYY-MM-DD` entry to
+[CHANGELOG.md](CHANGELOG.md), commit, then
+
+```sh
+git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin main vX.Y.Z
+```
+
+The [Release workflow](.github/workflows/release.yml) runs on the tag: it
+re-runs gofmt, vet and the tests, creates the GitHub Release with the
+changelog entry as its notes, warms proxy.golang.org and sum.golang.org so
+`go get github.com/porcupin26/skaidb-go@vX.Y.Z` resolves at once, and checks
+that the published module reports `X.Y.Z` from `Version()`. There is no
+version constant to bump and no registry credential: a Go module is
+published by its tag. Never move or delete a pushed tag — the proxy and the
+checksum database keep it forever.
 
 License: [SSPL-1.0](LICENSE).

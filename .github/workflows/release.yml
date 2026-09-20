@@ -1,0 +1,191 @@
+name: Release
+
+# A pushed vMAJOR.MINOR.PATCH tag *is* the release: Go modules are published
+# by the tag itself — proxy.golang.org fetches it from GitHub on first
+# request — so nothing is uploaded anywhere and no registry credential
+# exists. This workflow re-runs the checks at the tag, creates the GitHub
+# Release from the CHANGELOG.md entry (GITHUB_TOKEN), warms the module proxy
+# and the checksum database so `go get github.com/porcupin26/skaidb-go@<tag>`
+# resolves immediately, and proves that the published module reports the
+# tag as its Version().
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  MODULE: github.com/porcupin26/skaidb-go
+
+jobs:
+  release:
+    name: release ${{ github.ref_name }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false # pure standard library: no go.sum to key a cache on
+
+      - name: Check the tag
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          if ! printf '%s\n' "$TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag '$TAG' is not a Go module version (vMAJOR.MINOR.PATCH[-pre])"
+            exit 1
+          fi
+          MAJOR="${TAG#v}"; MAJOR="${MAJOR%%.*}"
+          WANT="$MODULE"
+          if [ "$MAJOR" -ge 2 ]; then WANT="$MODULE/v$MAJOR"; fi
+          HAVE="$(go list -m)"
+          if [ "$HAVE" != "$WANT" ]; then
+            echo "::error::tag '$TAG' needs module path '$WANT' in go.mod, found '$HAVE'"
+            exit 1
+          fi
+          # The driver carries no version constant: Version() is derived from the
+          # module build metadata, so the tag is the version (the last step proves
+          # it on the published module). CHANGELOG.md is the one file naming it.
+          if grep -q "^## \[${TAG#v}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has an entry for ${TAG#v}"
+          else
+            echo "::warning::CHANGELOG.md has no '## [${TAG#v}]' entry; the GitHub Release gets auto-generated notes"
+          fi
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -d . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -race -count=1 ./...
+      - name: build examples
+        run: go build ./...
+
+      - name: Release notes from CHANGELOG.md
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          PREV="$(git tag --list 'v*' --sort=-v:refname --merged HEAD | grep -vx "$TAG" | head -n1 || true)"
+          awk -v hdr="## [${TAG#v}]" '
+            index($0, "## [") == 1 { if (on) exit; on = (index($0, hdr) == 1); next }
+            on { print }
+          ' CHANGELOG.md > notes.md
+          sed -i -e '/./,$!d' -e :a -e '/^\n*$/{$d;N;ba' -e '}' notes.md
+          if [ ! -s notes.md ]; then
+            echo "no CHANGELOG.md entry for ${TAG#v}: asking GitHub to generate the notes"
+            gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$TAG" ${PREV:+-f previous_tag_name="$PREV"} -q .body > notes.md \
+              || echo "_No changelog entry for $TAG._" > notes.md
+          fi
+          {
+            echo
+            echo '```sh'
+            echo "go get $MODULE@$TAG"
+            echo '```'
+            if [ -n "$PREV" ]; then
+              echo
+              echo "Full changelog: https://github.com/$GITHUB_REPOSITORY/compare/$PREV...$TAG"
+            fi
+          } >> notes.md
+          echo "--- release notes ---"
+          cat notes.md
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          PRE=()
+          case "$TAG" in *-*) PRE=(--prerelease) ;; esac
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists already (re-run): updating its notes"
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file notes.md ${PRE[@]+"${PRE[@]}"}
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --verify-tag --notes-file notes.md ${PRE[@]+"${PRE[@]}"}
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url,tagName,isPrerelease
+
+      - name: Warm the Go module proxy
+        env:
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+          GONOSUMDB: ""
+          GONOSUMCHECK: ""
+          GOPRIVATE: ""
+          GOFLAGS: ""
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          scratch="$(mktemp -d)"; cd "$scratch"
+          go mod init tmp >/dev/null 2>&1
+          # The proxy fetches a brand-new tag from GitHub on its first request;
+          # allow it a few tries before calling the tag unpublished.
+          for i in $(seq 1 12); do
+            if out="$(go list -m "$MODULE@$TAG" 2>&1)"; then echo "$out"; break; fi
+            echo "attempt $i: $out"
+            if [ "$i" -eq 12 ]; then echo "::error::proxy.golang.org never served $MODULE@$TAG"; exit 1; fi
+            sleep 10
+          done
+          echo "--- https://proxy.golang.org/$MODULE/@v/$TAG.info ---"
+          curl -fsS "https://proxy.golang.org/$MODULE/@v/$TAG.info"; echo
+          echo "--- https://proxy.golang.org/$MODULE/@v/list ---"
+          curl -fsS "https://proxy.golang.org/$MODULE/@v/list"
+
+      - name: Verify the published module reports the tag
+        env:
+          GOPROXY: https://proxy.golang.org
+          GOSUMDB: sum.golang.org
+          GONOSUMDB: ""
+          GONOSUMCHECK: ""
+          GOPRIVATE: ""
+          GOFLAGS: ""
+          GOTOOLCHAIN: local
+        run: |
+          set -euo pipefail
+          TAG="$GITHUB_REF_NAME"
+          scratch="$(mktemp -d)"; cd "$scratch"
+          go mod init tmp >/dev/null 2>&1
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "fmt"
+
+              skaidb "github.com/porcupin26/skaidb-go"
+          )
+
+          func main() { fmt.Print(skaidb.Version()) }
+          EOF
+          go get "$MODULE@$TAG"
+          got="$(go run .)"
+          echo "Version() of $MODULE@$TAG = '$got'"
+          if [ "$got" != "${TAG#v}" ]; then
+            echo "::error::the module at $TAG reports Version() = '$got', want '${TAG#v}'"
+            exit 1
+          fi
+          echo "--- https://sum.golang.org/lookup/$MODULE@$TAG ---"
+          curl -fsS "https://sum.golang.org/lookup/$MODULE@$TAG" | head -n 3
+          {
+            echo "## $MODULE@$TAG"
+            echo
+            echo "- GitHub Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+            echo "- proxy: https://proxy.golang.org/$MODULE/@v/$TAG.info"
+            echo "- sumdb: https://sum.golang.org/lookup/$MODULE@$TAG"
+            echo "- \`Version()\` reported by the published module: \`$got\`"
+          } >> "$GITHUB_STEP_SUMMARY"

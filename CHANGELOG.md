@@ -4,6 +4,15 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.0.2] — 2026-09-20
+
+### Changed
+- Release automation: published from GitHub Actions. Pushing a `vX.Y.Z` tag
+  now runs the checks, creates the GitHub Release from this changelog, warms
+  the Go module proxy and the checksum database, and verifies that the
+  published module reports the tag as `Version()`
+  (`.github/workflows/release.yml`). No driver code changed.
+
 ## [1.0.1] — 2026-09-19
 
 ### Fixed
