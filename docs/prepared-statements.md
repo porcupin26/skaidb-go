@@ -29,7 +29,10 @@ Prepared ids are only valid on the connection that created them, so the
 cache is per pooled connection, keyed by statement text, up to 240
 entries. Running one statement in a loop prepares it once per connection it
 lands on. There is nothing to close or invalidate: a connection's cache
-goes away with it.
+goes away with it. A statement prepared once the cache is full is used for
+its one execution and then closed on the server (`OP_CLOSE`), so a
+connection that runs thousands of distinct statement texts stays under the
+server's limit of 256 open statements per connection.
 
 Consequence: a `*sql.Stmt` and `db.Exec(text, args...)` in a loop cost the
 same. Use whichever reads better.

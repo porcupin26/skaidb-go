@@ -4,6 +4,39 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.1.0] — 2026-09-26
+
+### Added
+- One-round-trip batches: `ExecBatch(ctx, db, query, rows)` and
+  `ExecBatchConn(ctx, conn, query, rows)` run one statement over many
+  parameter rows with `OP_EXECUTE_BATCH` and return the total affected
+  count. The driver's `driver.Conn` implements the new `BatchExecer`
+  interface, reachable through `(*sql.Conn).Raw`. Batches larger than a wire
+  frame (64 MiB) go out in chunks, one round trip each; unpreparable
+  statements and servers older than the opcode fall back to one statement
+  per row.
+- Certificate login (the protocol's EXTERNAL mechanism): DSN options
+  `tls_client_cert` / `tls_client_key` present a client certificate in the
+  TLS handshake, and `auth_mechanism=certificate` authenticates with it (the
+  certificate's Common Name is the username; a DSN without a user sends an
+  empty one).
+- The shared skaidb wire-protocol conformance suite
+  (`conformance/vectors.json`, `conformance_test.go`): value and SCRAM
+  vectors, the auth outcomes, and every case through `database/sql` against
+  a fake server replaying the server's reference bytes. CI also fails when
+  the vendored vectors differ from <https://skaidb.org/conformance/vectors.json>.
+
+### Fixed
+- A statement prepared after the per-connection cache was full (240
+  statement texts) was never closed on the server. A long-lived connection
+  running many distinct statements reached the server's cap of 256 open
+  statements, after which every new statement silently fell back to
+  client-side text binding — and arrays and documents, which only bind on
+  the typed path, failed. Such a statement is now closed (`OP_CLOSE`) after
+  its execution.
+- A successful SCRAM outcome shorter than its 32-byte signature is reported
+  as a handshake decode error instead of being checked against zeros.
+
 ## [1.0.3] — 2026-09-20
 
 ### Fixed

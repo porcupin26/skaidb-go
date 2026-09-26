@@ -16,6 +16,9 @@ stable within the 1.x line.
 | `skaidb: bad seed "…"` | non-numeric or out-of-range port, unclosed IPv6 bracket, empty host |
 | `skaidb: bad consistency "…"` | not `one`/`quorum`/`all` |
 | `skaidb: bad tls "…"`, `skaidb: bad tls_insecure "…"` | not a boolean |
+| `skaidb: tls_client_cert and tls_client_key go together` | only one of the two given |
+| `skaidb: auth_mechanism=certificate needs tls_client_cert and tls_client_key` | certificate login without a certificate |
+| `skaidb: bad auth_mechanism "…"` | not `scram` or `certificate` |
 
 ## From the first statement on a connection (dial)
 
@@ -25,7 +28,8 @@ stable within the 1.x line.
 | `skaidb: connect failed: …` | TCP (wrapped in the above) |
 | `skaidb: TLS handshake failed: …` | certificate not trusted, name mismatch (`tls_server_name`), plaintext server, or `client_tls = required` on a plaintext dial |
 | `skaidb: cannot read tls_ca "…"`, `skaidb: no certificates found in tls_ca "…"` | the CA file |
-| `skaidb: authentication denied: <reason>` | wrong user or password, user disabled |
+| `skaidb: cannot load tls_client_cert/tls_client_key: …` | the client certificate or key file is unreadable, not PEM, or the two do not match |
+| `skaidb: authentication denied: <reason>` | wrong user or password, user disabled; with certificate login, a certificate the server does not trust or a DSN user that differs from its CN |
 | `skaidb: server signature mismatch (mutual auth failed)` | the peer knows the password's derived key but not the password — or is not the server you think |
 | `skaidb: bad handshake challenge` / `outcome`, `skaidb: handshake decode: …` | not a skaidb server on that port |
 | an error from `USE "<database>"` | the DSN database does not exist or is not granted |
@@ -41,6 +45,9 @@ stable within the 1.x line.
 | `skaidb: cannot bind NaN/Infinity` | non-finite float |
 | `skaidb: document keys must be strings` | a map with non-string keys |
 | `sql: converting argument $N type: …` | `database/sql`'s default converter refused a scalar (e.g. `uint64` above `MaxInt64`) |
+| `skaidb: batch row N: statement expects K parameters, got M` | an `ExecBatch` row of the wrong width; nothing was sent |
+| `skaidb: batch row N is B bytes, over the L-byte frame limit` | one `ExecBatch` row larger than a wire frame |
+| `skaidb: <server message> (row numbers count from batch row N; the N rows before it applied)` | a chunked `ExecBatch` failed in a later chunk |
 | `skaidb: bad consistency "…"` | `WithConsistency` with an unknown level; the statement did not run |
 | `skaidb: transactions are not supported` | `Begin`/`BeginTx` |
 | `skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow` | `Result.LastInsertId` |

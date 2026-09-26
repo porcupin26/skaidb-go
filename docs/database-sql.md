@@ -84,6 +84,11 @@ stay on one socket: a batch on one prepared statement, or a `USE` followed by
 statements that depend on it (prefer the DSN path for the session database —
 it is applied to every pooled connection, `USE` through `Exec` is not).
 
+`conn.Raw(func(driverConn any) error { … })` exposes the driver's
+connection, which implements `skaidb.BatchExecer`: one statement over many
+parameter rows in one round trip. `skaidb.ExecBatchConn(ctx, conn, query,
+rows)` wraps it; see [batch.md](batch.md).
+
 Two goroutines must not share a `*sql.Conn` concurrently while one is
 iterating a streamed result; the second statement fails with a "busy
 streaming" error rather than corrupting the socket.

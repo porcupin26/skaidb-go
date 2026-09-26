@@ -7,9 +7,9 @@ chapters go deeper on one topic each.
 |---|---|
 | [getting-started.md](getting-started.md) | install, first connection, the schema-less model, where things can go wrong |
 | [database-sql.md](database-sql.md) | how the stdlib API maps onto skaidb: `Exec`, `Query`, `QueryRow`, `Stmt`, `Conn`, `Rows`, `Result` |
-| [dsn.md](dsn.md) | the DSN grammar, seeds and failover, the session database, consistency, the TLS modes |
+| [dsn.md](dsn.md) | the DSN grammar, seeds and failover, the session database, consistency, the TLS modes, certificate login |
 | [prepared-statements.md](prepared-statements.md) | server-side preparation, the per-connection cache, typed parameters, the client-side fallback |
-| [batch.md](batch.md) | bulk writes without transactions, `RETURNING`, upserts, throughput patterns |
+| [batch.md](batch.md) | `ExecBatch` (many rows, one round trip), bulk writes without transactions, `RETURNING`, upserts, throughput patterns |
 | [streaming.md](streaming.md) | `WithStreaming`, server-side paging, the abandon/drain rule |
 | [streams.md](streams.md) | `Subscribe` over `CREATE STREAM` logs, resuming, idempotency, MQTT push |
 | [context.md](context.md) | deadlines, cancellation, what happens to the connection and the statement |

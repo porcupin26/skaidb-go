@@ -62,7 +62,7 @@ DDL runs at quorum on the server regardless of the requested level.
 
 ## TLS
 
-Any of `tls`, `tls_ca` or `tls_insecure` switches the connection to TLS;
+Any of `tls`, `tls_ca`, `tls_insecure` or `tls_client_cert` switches the connection to TLS;
 the handshake completes before the first protocol byte.
 
 | Option | Effect |
@@ -80,6 +80,33 @@ A server with `client_tls = required` closes plaintext connections at
 once; the symptom without a TLS option is a connect or handshake error on
 every seed.
 
+## Certificate login
+
+`auth_mechanism=certificate` authenticates with a TLS client certificate
+instead of a password (the wire protocol's EXTERNAL mechanism):
+
+| Option | Effect |
+|---|---|
+| `tls_client_cert=/path/client.crt` | PEM client certificate presented in the TLS handshake. Enables TLS |
+| `tls_client_key=/path/client.key` | its PEM private key; always given with `tls_client_cert` |
+| `auth_mechanism=certificate` | log in as the certificate's subject Common Name. `scram` (the default) logs in with the DSN password |
+
+```
+skaidb://db1,db2/app?auth_mechanism=certificate&tls_ca=/etc/skaidb/ca.pem&tls_client_cert=/etc/skaidb/ada.crt&tls_client_key=/etc/skaidb/ada.key
+```
+
+The server needs `auth.x509_enabled` and a CA for client certificates
+(`auth.x509_ca_file`). The certificate's **Common Name is the username**. A
+user in the DSN is optional and must equal it; without one the driver sends
+an empty username and the server takes the CN. No password is exchanged,
+and the server's signature in the outcome is not checked — TLS already
+authenticated the server, so verify it with `tls_ca` or the system roots
+rather than `tls_insecure`.
+
+A client certificate without `auth_mechanism=certificate` is presented in
+the TLS handshake (for a server that asks for one) and the login stays
+SCRAM.
+
 ## Validation
 
 These fail `sql.Open`:
@@ -88,7 +115,10 @@ These fail `sql.Open`:
 - no host;
 - a port that is not a number in 1–65535, an unclosed IPv6 bracket;
 - `consistency` outside `one|quorum|all`;
-- `tls` / `tls_insecure` outside `true|false|1|0`.
+- `tls` / `tls_insecure` outside `true|false|1|0`;
+- `tls_client_cert` without `tls_client_key` or the reverse;
+- `auth_mechanism` outside `scram|password|certificate|external|x509`, or
+  `certificate` without a client certificate.
 
 Unknown options are ignored, so a typo in an option name is not caught.
 

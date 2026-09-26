@@ -5,10 +5,75 @@ skaidb has no multi-statement transactions. `db.Begin()` returns
 own and commits when the server acknowledges it at the requested
 consistency.
 
-## Bulk writes
+## Bulk writes: `ExecBatch`
 
-The efficient shape is one prepared statement, executed many times, on one
-connection:
+`database/sql` has no batch call, and `ExecContext` per row costs one
+network round trip per row. `skaidb.ExecBatch` runs one statement over many
+parameter rows in a single `OP_EXECUTE_BATCH` request and returns the total
+affected-row count:
+
+```go
+rows := make([][]any, 0, len(events))
+for _, e := range events {
+	rows = append(rows, []any{e.ID, e.At, e.Payload})
+}
+n, err := skaidb.ExecBatch(ctx, db, "INSERT INTO events (id, ts, payload) VALUES (?, ?, ?)", rows)
+if err != nil { return err }
+log.Printf("%d rows written", n)
+```
+
+1,000 rows are two requests: one `OP_PREPARE` (cached per connection after
+the first time) and one `OP_EXECUTE_BATCH`.
+
+On a connection you have pinned, `skaidb.ExecBatchConn(ctx, conn, query,
+rows)` does the same. Both wrap the `database/sql` escape hatch, which you
+can use directly: the driver's `driver.Conn` implements
+`skaidb.BatchExecer`.
+
+```go
+conn, err := db.Conn(ctx)
+if err != nil { return err }
+defer conn.Close()
+var n int64
+err = conn.Raw(func(driverConn any) error {
+	bc := driverConn.(skaidb.BatchExecer)
+	var err error
+	n, err = bc.ExecBatch(ctx, "INSERT INTO t (id, v) VALUES (?, ?)", [][]any{{1, "a"}, {2, "b"}})
+	return err
+})
+```
+
+What to know:
+
+- **Binding.** Each row binds like the arguments of `ExecContext`:
+  scalars, `time.Time`, `[]byte`, `sql.Null*` and any `driver.Valuer`,
+  pointers, named types, slices and maps (arrays and documents). Every row
+  must carry the statement's parameter count; a mismatch fails before
+  anything is sent (`skaidb: batch row 3: statement expects 2 parameters,
+  got 1`).
+- **Context.** Deadline, cancellation and `skaidb.WithConsistency` apply to
+  the whole batch.
+- **Size.** One request is at most one wire frame (64 MiB). A larger batch
+  goes out in consecutive chunks, each one round trip, in row order. A
+  single row larger than a frame is an error.
+- **Failure.** Rows run in order, each auto-committed. The first failing
+  row ends the batch with the server's error, which names the row within
+  its request; the rows before it stay applied. When the batch was
+  chunked, the returned count covers the chunks that applied and the error
+  adds `(row numbers count from batch row N; the N rows before it
+  applied)`.
+- **Fallbacks.** A statement the server will not prepare (DDL, `CALL`) runs
+  text-bound, one request per row; a server older than the batch opcode
+  (< 0.87.0) gets one `OP_EXECUTE` per row. Same results, more round trips.
+- **Retries.** `ExecBatch` (the `*sql.DB` form) retries on a fresh
+  connection only when the request never reached the wire, as
+  `database/sql` does for its own calls. Once a request was sent, a lost
+  connection is reported, never retried.
+
+## A loop of prepared statements
+
+When each row needs its own result, or its own error handling, run one
+prepared statement many times on one connection:
 
 ```go
 conn, err := db.Conn(ctx)

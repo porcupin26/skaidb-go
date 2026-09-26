@@ -1,5 +1,5 @@
 // Prepared statements, typed parameters (arrays and documents), per-statement
-// consistency, RETURNING, and a batch loop:
+// consistency, RETURNING, a statement loop and a one-round-trip batch:
 //
 //	go run ./examples/prepared "skaidb://user:pass@host:7000/app"
 package main
@@ -37,10 +37,23 @@ func main() {
 		log.Fatal(err)
 	}
 	defer ins.Close()
-	for i := 1; i <= 100; i++ { // a "batch": one prepared statement, many executions
+	for i := 1; i <= 100; i++ { // a loop: one prepared statement, many executions
 		must(ins.ExecContext(ctx, i, fmt.Sprintf("cust-%d", i%7),
 			[]string{"web", "promo"}, map[string]any{"amount": i * 10, "rush": i%3 == 0}))
 	}
+
+	// A batch: the same statement over many rows in ONE round trip.
+	rows := make([][]any, 0, 1000)
+	for i := 1001; i <= 2000; i++ {
+		rows = append(rows, []any{i, fmt.Sprintf("cust-%d", i%7),
+			[]string{"bulk"}, map[string]any{"amount": i, "rush": false}})
+	}
+	written, err := skaidb.ExecBatch(ctx, db,
+		"INSERT INTO orders (id, customer, tags, meta) VALUES (?, ?, ?, ?)", rows)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println("batch wrote", written)
 
 	// RETURNING instead of LastInsertId (which is not carried on the wire).
 	var id int64

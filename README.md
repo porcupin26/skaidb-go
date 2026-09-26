@@ -27,11 +27,11 @@ db, err := sql.Open("skaidb", "skaidb://skaidb:secret@localhost:7000/app?consist
 
 1. [Install](#install)
 2. [Quick start](#quick-start)
-3. [DSN reference](#dsn-reference) — seeds and failover, database, consistency, TLS modes
+3. [DSN reference](#dsn-reference) — seeds and failover, database, consistency, TLS modes, certificate login
 4. [Public API](#public-api) — every exported symbol
 5. [Parameter binding and type mapping](#parameter-binding-and-type-mapping)
 6. [Prepared statements](#prepared-statements)
-7. [Batches and transactions](#batches-and-transactions)
+7. [Batches and transactions](#batches-and-transactions) — `ExecBatch`: many rows, one round trip
 8. [Streaming large results](#streaming-large-results) — and the abandon/drain rule
 9. [Streams: `Subscribe`](#streams-subscribe)
 10. [Context: deadlines and cancellation](#context-deadlines-and-cancellation)
@@ -39,8 +39,9 @@ db, err := sql.Open("skaidb", "skaidb://skaidb:secret@localhost:7000/app?consist
 12. [Multiple result sets](#multiple-result-sets)
 13. [Errors](#errors)
 14. [Versioning and compatibility](#versioning-and-compatibility)
-15. [Development](#development)
-16. [Releasing](#releasing)
+15. [Conformance](#conformance)
+16. [Development](#development)
+17. [Releasing](#releasing)
 
 Further reading: [server documentation](https://skaidb.org/docs/) ·
 [wire protocol](https://skaidb.org/docs/PROTOCOL.html) ·
@@ -76,7 +77,7 @@ The module is a single package with no dependencies. `go mod vendor` works
 as usual; or point a `replace` at a checkout:
 
 ```
-require github.com/porcupin26/skaidb-go v1.0.1
+require github.com/porcupin26/skaidb-go v1.1.0
 replace github.com/porcupin26/skaidb-go => ../skaidb-go
 ```
 
@@ -134,7 +135,7 @@ func main() {
 ```
 
 Runnable programs live in [`examples/`](examples/): `basic`, `prepared`
-(typed parameters, `RETURNING`, per-statement consistency, batch loop),
+(typed parameters, `RETURNING`, per-statement consistency, a statement loop, `ExecBatch`),
 `streaming`, `subscribe`. Run one with
 `go run ./examples/basic "skaidb://user:pass@host:7000/app"`.
 
@@ -146,14 +147,16 @@ skaidb://[user[:password]@]host[:port][,host2[:port]...][/database][?option=valu
 
 | Part | Meaning | Default |
 |---|---|---|
-| `user`, `password` | SCRAM-SHA-256 credentials. Percent-encode reserved characters (`@` → `%40`, `/` → `%2F`, `:` → `%3A`, `?` → `%3F`, `#` → `%23`). Omit both for a server with authentication disabled. | `anonymous`, empty |
+| `user`, `password` | SCRAM-SHA-256 credentials. Percent-encode reserved characters (`@` → `%40`, `/` → `%2F`, `:` → `%3A`, `?` → `%3F`, `#` → `%23`). Omit both for a server with authentication disabled. With `auth_mechanism=certificate` the user is optional (it must equal the certificate's Common Name) and there is no password. | `anonymous`, empty |
 | `host[:port]`, comma-separated | The **seed list**. Any mix of ports; IPv6 literals in brackets (`[::1]:7000`, `[fe80::1]`). | port `7000` |
 | `/database` | Session database: `USE "<database>"` runs on every new pooled connection. | server default |
 | `consistency` | `one`, `quorum` or `all` — the level for every statement on the connection unless overridden per statement with [`WithConsistency`](#withconsistency). | `quorum` |
-| `tls` | `true`/`1` enables TLS with system-root certificate verification. Implied by `tls_ca` or `tls_insecure`. | `false` |
+| `tls` | `true`/`1` enables TLS with system-root certificate verification. Implied by `tls_ca`, `tls_insecure` or `tls_client_cert`. | `false` |
 | `tls_ca` | Path to a PEM bundle; the server certificate must chain to it. Enables TLS. | — |
 | `tls_insecure` | `true`/`1` encrypts but verifies **nothing**. Development against a self-signed node only. Enables TLS. | `false` |
 | `tls_server_name` | SNI and the name checked against the certificate's SANs. skaidb's own certificates carry `DNS:skaidb`, so the default is right for them and is usually *not* the address you dialled. | `skaidb` |
+| `tls_client_cert`, `tls_client_key` | Paths to a PEM client certificate and its private key, presented in the TLS handshake. Always given together. Enables TLS. | — |
+| `auth_mechanism` | `scram` (password, SCRAM-SHA-256) or `certificate` (the TLS client certificate is the credential; needs `tls_client_cert`/`tls_client_key`). See [certificate login](#certificate-login). | `scram` |
 
 Unknown options are ignored; a malformed value (`consistency=eventual`,
 `tls=maybe`, a non-numeric port) makes `sql.Open` itself return the error —
@@ -187,6 +190,29 @@ of the three TLS forms is mandatory there. The handshake completes before
 any protocol byte is written; a failure surfaces as
 `skaidb: TLS handshake failed: …` from the connect, never mid-statement.
 
+### Certificate login
+
+With `auth_mechanism=certificate` the connection authenticates with its TLS
+client certificate instead of a password (the protocol's EXTERNAL
+mechanism). The server must have `auth.x509_enabled` and trust the
+certificate's CA (`auth.x509_ca_file`); the certificate's subject **Common
+Name is the username**.
+
+```go
+db, err := sql.Open("skaidb", "skaidb://db1,db2,db3/app"+
+	"?auth_mechanism=certificate"+
+	"&tls_ca=/etc/skaidb/ca.pem"+
+	"&tls_client_cert=/etc/skaidb/ada.crt&tls_client_key=/etc/skaidb/ada.key")
+```
+
+A user in the DSN (`skaidb://ada@…`) is optional and must equal the CN; a
+password is ignored. The server's 32-byte signature in the outcome is not
+checked on this path — TLS already authenticated the server, so pair it with
+`tls_ca` (or the system roots), not `tls_insecure`. A client certificate
+without `auth_mechanism=certificate` is simply presented in the handshake
+and the login stays SCRAM. A denied certificate fails the connect with
+`skaidb: authentication denied: <reason>`.
+
 ### Consistency
 
 `one`, `quorum`, `all` select how many replicas must acknowledge a write or
@@ -199,7 +225,9 @@ More: [docs/dsn.md](docs/dsn.md).
 ## Public API
 
 The package registers itself as `"skaidb"` with `database/sql` in `init`.
-Beyond the stdlib surface it exports five symbols.
+Beyond the stdlib surface it exports `Version`, `WithStreaming`,
+`WithConsistency`, `Subscribe`/`Event` and the batch API (`ExecBatch`,
+`ExecBatchConn`, `BatchExecer`).
 
 ### `Version`
 
@@ -275,6 +303,22 @@ returns an error (returned as is). `after` is the `Event.ID` to resume from;
 `pre_image = true` stream is not carried by `Event`; query `_stream_<name>`
 directly for it. See [Streams](#streams-subscribe).
 
+### `ExecBatch`, `ExecBatchConn` and `BatchExecer`
+
+```go
+func ExecBatch(ctx context.Context, db *sql.DB, query string, rows [][]any) (int64, error)
+func ExecBatchConn(ctx context.Context, c *sql.Conn, query string, rows [][]any) (int64, error)
+
+type BatchExecer interface {
+	ExecBatch(ctx context.Context, query string, rows [][]any) (int64, error)
+}
+```
+
+Run one statement over many parameter rows in **one round trip** and get the
+total affected-row count; see [batches](#batches-and-transactions).
+`BatchExecer` is implemented by the driver's `driver.Conn`, reachable through
+`(*sql.Conn).Raw`; the two functions wrap that.
+
 ### `database/sql` interfaces implemented
 
 For the curious, and for anyone using `driver` types directly:
@@ -283,7 +327,7 @@ For the curious, and for anyone using `driver` types directly:
 |---|---|
 | `driver.Driver`, `driver.DriverContext` | `OpenConnector(dsn)` parses the DSN at `sql.Open` (a malformed DSN fails there, nothing is dialled); `Open(dsn)` parses and dials, for code that holds the driver value directly |
 | `driver.Connector` | one seed-list dial per pooled connection; `db.Driver()` returns the registered driver |
-| `driver.Conn` | `Prepare`, `Close`; `Begin` returns an error (no transactions) |
+| `driver.Conn` | `Prepare`, `Close`; `Begin` returns an error (no transactions). Also implements this package's `BatchExecer` (via `(*sql.Conn).Raw`) |
 | `driver.Validator` | retires connections broken mid-statement before the pool reuses them |
 | `driver.NamedValueChecker` | accepts any Go value so slices and maps can reach the typed path |
 | `driver.QueryerContext`, `driver.ExecerContext` | the main statement path |
@@ -392,8 +436,51 @@ skaidb is non-transactional: every statement auto-commits, and `db.Begin()`
 / `db.BeginTx()` return `skaidb: transactions are not supported`. Do not
 write code that expects rollback.
 
-A **batch** is therefore a loop over one prepared statement on one
-connection. To keep it on one connection (one prepare, one socket, in-order
+A **batch** runs one statement over many parameter rows. `database/sql`
+has no batch call — `ExecContext` per row costs one network round trip each
+— so the driver adds one. `ExecBatch` sends every row in a single
+`OP_EXECUTE_BATCH` request:
+
+```go
+rows := make([][]any, 0, len(events))
+for _, e := range events {
+    rows = append(rows, []any{e.ID, e.At, e.Payload})
+}
+n, err := skaidb.ExecBatch(ctx, db, "INSERT INTO events (id, ts, payload) VALUES (?, ?, ?)", rows)
+// n is the total affected-row count
+```
+
+On a connection you already hold (`db.Conn`), use `skaidb.ExecBatchConn(ctx,
+conn, query, rows)`, or the `database/sql` escape hatch it wraps:
+
+```go
+err := conn.Raw(func(driverConn any) error {
+    bc := driverConn.(skaidb.BatchExecer)
+    n, err := bc.ExecBatch(ctx, "INSERT INTO t (id, v) VALUES (?, ?)", rows)
+    _ = n
+    return err
+})
+```
+
+- Rows bind exactly like `ExecContext` arguments (scalars, `time.Time`,
+  `[]byte`, `sql.Null*` and other `driver.Valuer`s, pointers, slices and
+  maps as arrays and documents). Every row must have the statement's
+  parameter count; a mismatch fails before anything is sent.
+- The context's deadline, cancellation and [`WithConsistency`](#withconsistency)
+  apply to the whole batch.
+- A request is at most one wire frame (64 MiB). A larger batch is split
+  into consecutive chunks, one round trip each; a single row over the limit
+  is an error.
+- Rows run in order, each auto-committed. The first failing row stops the
+  batch with the server's error, which names the row; the rows before it
+  stay applied. In a multi-chunk batch the returned count covers the chunks
+  that applied, and the error says from which batch row the server's row
+  numbers count.
+- A statement the server will not prepare (DDL, `CALL`), or a server
+  without the batch opcode, falls back to one statement per row.
+
+The per-row loop still works, and is the shape when each row needs its own
+result. To keep it on one connection (one prepare, one socket, in-order
 delivery) take a `*sql.Conn`:
 
 ```go
@@ -611,9 +698,11 @@ sentinels.
 |---|---|
 | malformed DSN | `skaidb: bad DSN: …`, `skaidb: DSN scheme must be skaidb://`, `skaidb: DSN has no host`, `skaidb: bad seed "…"`, `skaidb: bad consistency "…"`, `skaidb: bad tls …` — from `sql.Open` |
 | no seed reachable | `skaidb: no reachable endpoint in [seeds]: <last error>` |
-| TLS | `skaidb: TLS handshake failed: …`, `skaidb: cannot read tls_ca "…"`, `skaidb: no certificates found in tls_ca "…"` |
+| TLS | `skaidb: TLS handshake failed: …`, `skaidb: cannot read tls_ca "…"`, `skaidb: no certificates found in tls_ca "…"`, `skaidb: cannot load tls_client_cert/tls_client_key: …` |
+| certificate options | `skaidb: tls_client_cert and tls_client_key go together`, `skaidb: auth_mechanism=certificate needs tls_client_cert and tls_client_key`, `skaidb: bad auth_mechanism "…"` — from `sql.Open` |
 | authentication | `skaidb: authentication denied: <reason>`, `skaidb: server signature mismatch (mutual auth failed)` |
 | the server rejected the statement (syntax, missing table, constraint, permission, budget…) | `skaidb: <server message>` |
+| batches | `skaidb: batch row N: statement expects K parameters, got M`, `skaidb: batch row N is B bytes, over the L-byte frame limit`, `skaidb: <server message> (row numbers count from batch row N; the N rows before it applied)` |
 | parameter problems | `skaidb: statement expects N parameters, got M`, `skaidb: more placeholders than parameters`, `skaidb: more parameters than placeholders`, `skaidb: cannot bind value of type T`, `skaidb: cannot bind NaN/Infinity`, `skaidb: document keys must be strings` |
 | bad consistency in `WithConsistency` | `skaidb: bad consistency "…"` |
 | transactions | `skaidb: transactions are not supported` |
@@ -641,10 +730,42 @@ More: [docs/errors.md](docs/errors.md).
   ≥ 0.17.0 (older servers get client-side binding), streaming needs the
   streaming opcode (older servers answer a buffered result), the Hello
   self-identification (server ≥ 0.203.0) is best-effort and ignored where
-  unknown. Multiple result sets and `RETURNING` are server features the
+  unknown, `ExecBatch` needs server ≥ 0.87.0 (older servers get one
+  statement per row), and certificate login needs a server with the
+  EXTERNAL mechanism and `auth.x509_enabled`. Multiple result sets and `RETURNING` are server features the
   driver merely passes through. Developed against skaidb 0.290.
 - The version the driver reports in Hello is [`Version()`](#version), always
   equal to the module version in your `go.mod`.
+
+## Conformance
+
+The driver runs skaidb's shared wire-protocol conformance suite:
+[`conformance/vectors.json`](conformance/vectors.json), generated from the
+server's reference encoders and published at
+<https://skaidb.org/conformance/vectors.json> (contract:
+[`conformance/README.md`](conformance/README.md)). `conformance_test.go`
+
+- decodes every value vector (and encodes it where Go can express the
+  value as a parameter), and checks the driver's SCRAM computations;
+- runs the auth outcomes (ok, a server signature that does not verify,
+  denied) and every case through `database/sql` and `ExecBatchConn` against
+  a fake server that verifies the client proof with its own crypto and
+  replays the reference responses, matching the driver's requests byte for
+  byte.
+
+Skipped, each printed as a `conformance: SKIP` line
+(`go test -v -run TestConformance .`):
+
+- **encoding** of the Decimal and Uuid vectors — the driver surfaces both
+  as strings and a string binds as String (decoding is checked);
+- the **affected count** of `stream_non_row_result` — `WithStreaming` is
+  `database/sql`'s `Query`, and `Rows` carry no affected count; the case
+  still checks the request bytes and that the statement succeeded without
+  rows.
+
+A Document decodes to a `map[string]any`, so its wire key order is not
+compared. CI fails when the vendored vectors differ from the published
+copy.
 
 ## Development
 

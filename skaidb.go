@@ -163,6 +163,14 @@ type config struct {
 	tlsCA       string
 	tlsInsecure bool
 	tlsName     string
+	// A client certificate + key (PEM files) presented in the TLS
+	// handshake: the credential for auth_mechanism=certificate, and
+	// harmless otherwise (a server that does not ask ignores it).
+	tlsClientCert string
+	tlsClientKey  string
+	// certAuth selects the EXTERNAL mechanism (PROTOCOL.md §2.4): the TLS
+	// client certificate is the credential and no password is exchanged.
+	certAuth bool
 }
 
 func parseDSN(dsn string) (config, error) {
@@ -188,8 +196,10 @@ func parseDSN(dsn string) (config, error) {
 		return config{}, fmt.Errorf("skaidb: bad DSN: %w", err)
 	}
 	cfg := config{user: "anonymous", consistency: consistencyQuorum}
+	userGiven := false
 	if u.User != nil {
 		cfg.user = u.User.Username()
+		userGiven = cfg.user != ""
 		if p, ok := u.User.Password(); ok {
 			cfg.password = p
 		}
@@ -242,7 +252,28 @@ func parseDSN(dsn string) (config, error) {
 	default:
 		return config{}, fmt.Errorf("skaidb: bad tls %q", q.Get("tls"))
 	}
-	cfg.tls = cfg.tls || cfg.tlsCA != "" || cfg.tlsInsecure
+	// Certificate login (EXTERNAL): the TLS client certificate is the
+	// credential, its subject Common Name the username. A username in the
+	// DSN must equal that CN; without one the server takes the CN.
+	cfg.tlsClientCert = q.Get("tls_client_cert")
+	cfg.tlsClientKey = q.Get("tls_client_key")
+	if (cfg.tlsClientCert == "") != (cfg.tlsClientKey == "") {
+		return config{}, fmt.Errorf("skaidb: tls_client_cert and tls_client_key go together")
+	}
+	switch strings.ToLower(q.Get("auth_mechanism")) {
+	case "", "scram", "password":
+	case "certificate", "external", "x509":
+		cfg.certAuth = true
+		if cfg.tlsClientCert == "" {
+			return config{}, fmt.Errorf("skaidb: auth_mechanism=certificate needs tls_client_cert and tls_client_key")
+		}
+		if !userGiven {
+			cfg.user = ""
+		}
+	default:
+		return config{}, fmt.Errorf("skaidb: bad auth_mechanism %q (use scram or certificate)", q.Get("auth_mechanism"))
+	}
+	cfg.tls = cfg.tls || cfg.tlsCA != "" || cfg.tlsInsecure || cfg.tlsClientCert != ""
 	// SNI must match a SAN on the server certificate, which is usually not
 	// the address you dialled — skaidb's own certs carry DNS:skaidb.
 	cfg.tlsName = q.Get("tls_server_name")
@@ -296,6 +327,13 @@ func tlsWrap(nc net.Conn, cfg config) (net.Conn, error) {
 			return nil, fmt.Errorf("skaidb: no certificates found in tls_ca %q", cfg.tlsCA)
 		}
 		tcfg.RootCAs = pool
+	}
+	if cfg.tlsClientCert != "" {
+		pair, err := tls.LoadX509KeyPair(cfg.tlsClientCert, cfg.tlsClientKey)
+		if err != nil {
+			return nil, fmt.Errorf("skaidb: cannot load tls_client_cert/tls_client_key: %w", err)
+		}
+		tcfg.Certificates = []tls.Certificate{pair}
 	}
 	tc := tls.Client(nc, tcfg)
 	if err := tc.Handshake(); err != nil {
@@ -398,9 +436,15 @@ func dialOne(cfg config, addr string) (*conn, error) {
 		nc = tc
 	}
 	c := &conn{nc: nc, consistency: cfg.consistency, stmtLevel: cfg.consistency, prepared: map[string]preparedStmt{}}
-	if err := c.handshake(cfg.user, cfg.password); err != nil {
+	var herr error
+	if cfg.certAuth {
+		herr = c.handshakeCertificate(cfg.user)
+	} else {
+		herr = c.handshake(cfg.user, cfg.password)
+	}
+	if herr != nil {
 		nc.Close()
-		return nil, err
+		return nil, herr
 	}
 	c.sendHello()
 	// Session database from the DSN path (skaidb://host:port/app). USE is
@@ -482,17 +526,8 @@ func (c *conn) handshake(user, password string) error {
 		return fmt.Errorf("skaidb: handshake decode: %w", r.err)
 	}
 
-	authMessage := []byte(strings.Join(
-		[]string{user, clientNonce, serverNonce, hex.EncodeToString(salt), strconv.FormatUint(uint64(iterations), 10)},
-		"\x00"))
-	salted := pbkdf2SHA256([]byte(password), salt, int(iterations), 32)
-	clientKey := hmacSHA256(salted, []byte("Client Key"))
-	storedKey := sha256.Sum256(clientKey)
-	clientSig := hmacSHA256(storedKey[:], authMessage)
-	proof := make([]byte, 32)
-	for i := range proof {
-		proof[i] = clientKey[i] ^ clientSig[i]
-	}
+	authMessage := scramAuthMessage(user, clientNonce, serverNonce, salt, iterations)
+	proof, expected := scramProof(password, salt, iterations, authMessage)
 	if err := c.writeFrame(append([]byte{12}, proof...)); err != nil {
 		return err
 	}
@@ -506,9 +541,10 @@ func (c *conn) handshake(user, password string) error {
 	}
 	if r.u8() == 1 {
 		serverSig := r.take(32)
+		if r.err != nil {
+			return fmt.Errorf("skaidb: handshake decode: %w", r.err)
+		}
 		if password != "" {
-			serverKey := hmacSHA256(salted, []byte("Server Key"))
-			expected := hmacSHA256(serverKey, authMessage)
 			if subtle.ConstantTimeCompare(serverSig, expected) != 1 {
 				return fmt.Errorf("skaidb: server signature mismatch (mutual auth failed)")
 			}
@@ -516,6 +552,70 @@ func (c *conn) handshake(user, password string) error {
 		return nil
 	}
 	return fmt.Errorf("skaidb: authentication denied: %s", r.text())
+}
+
+// scramAuthMessage builds the SCRAM auth message both sides sign
+// (PROTOCOL.md §2.1): the fields NUL-joined, the salt as lowercase hex.
+func scramAuthMessage(user, clientNonce, serverNonce string, salt []byte, iterations uint32) []byte {
+	return []byte(strings.Join(
+		[]string{user, clientNonce, serverNonce, hex.EncodeToString(salt), strconv.FormatUint(uint64(iterations), 10)},
+		"\x00"))
+}
+
+// scramProof computes the client proof sent in AuthFinish and the server
+// signature a genuine server answers with (PROTOCOL.md §2.1, §2.2).
+func scramProof(password string, salt []byte, iterations uint32, authMessage []byte) (proof, serverSig []byte) {
+	salted := pbkdf2SHA256([]byte(password), salt, int(iterations), 32)
+	clientKey := hmacSHA256(salted, []byte("Client Key"))
+	storedKey := sha256.Sum256(clientKey)
+	clientSig := hmacSHA256(storedKey[:], authMessage)
+	proof = make([]byte, 32)
+	for i := range proof {
+		proof[i] = clientKey[i] ^ clientSig[i]
+	}
+	return proof, hmacSHA256(hmacSHA256(salted, []byte("Server Key")), authMessage)
+}
+
+// handshakeCertificate authenticates with the EXTERNAL mechanism
+// (PROTOCOL.md §2.4): the TLS client certificate is the credential, so
+// AuthStart carries the username (empty, or the certificate's CN), an empty
+// client nonce and mechanism byte 2, and the server answers AuthOutcome at
+// once. The 32-byte signature of a successful outcome is zeros and is not
+// verified: TLS already authenticated the server.
+func (c *conn) handshakeCertificate(user string) error {
+	if _, ok := c.nc.(*tls.Conn); !ok {
+		return fmt.Errorf("skaidb: certificate authentication needs TLS with a client certificate")
+	}
+	return c.externalAuth(user)
+}
+
+// externalAuth is the EXTERNAL exchange itself, separate from the TLS
+// precondition so it can be exercised over any transport.
+func (c *conn) externalAuth(user string) error {
+	start := appendStr(appendStr([]byte{10}, user), "")
+	start = append(start, 2)
+	if err := c.writeFrame(start); err != nil {
+		return err
+	}
+	frame, err := c.readFrame()
+	if err != nil {
+		return fmt.Errorf("skaidb: certificate authentication: %w", err)
+	}
+	r := &reader{buf: frame}
+	if r.u8() != 13 || r.err != nil {
+		return fmt.Errorf("skaidb: bad handshake outcome")
+	}
+	switch r.u8() {
+	case 1:
+		_ = r.take(32)
+		if r.err != nil {
+			return fmt.Errorf("skaidb: handshake decode: %w", r.err)
+		}
+		return nil
+	case 0:
+		return fmt.Errorf("skaidb: authentication denied: %s", r.text())
+	}
+	return fmt.Errorf("skaidb: bad handshake outcome")
 }
 
 // ---- database/sql/driver interfaces ---------------------------------------
@@ -831,9 +931,15 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 // typed parameters. Returns errUnpreparable for statement kinds the server
 // declines, so the caller can fall back to client-side text binding.
 func (c *conn) preparedRoundtrip(query string, args []driver.NamedValue) (*reader, error) {
-	id, nparams, err := c.prepareServer(query)
+	id, nparams, cached, err := c.prepareServer(query)
 	if err != nil {
 		return nil, err
+	}
+	if !cached {
+		// Past the cache's capacity the id is used once: free its server
+		// slot after the reply (sendPrepared has read it by then), or a
+		// long-lived connection runs into the server's per-connection cap.
+		defer c.closePrepared(id)
 	}
 	if nparams != len(args) {
 		return nil, fmt.Errorf("skaidb: statement expects %d parameters, got %d", nparams, len(args))
@@ -993,29 +1099,34 @@ func encodeValue(out []byte, v any) ([]byte, error) {
 // session statements). The caller then falls back to client-side text binding.
 var errUnpreparable = fmt.Errorf("skaidb: statement cannot be prepared")
 
-// prepareServer prepares sqlText on the SERVER, returning (id, paramCount).
-// Cached per connection: a prepared id is only meaningful on the connection
-// that created it.
-func (c *conn) prepareServer(sqlText string) (uint32, int, error) {
+// preparedCacheSize bounds the per-connection statement cache, below the
+// server's cap of 256 open statements per connection.
+const preparedCacheSize = 240
+
+// prepareServer prepares sqlText on the SERVER, returning (id, paramCount,
+// cached). Cached per connection: a prepared id is only meaningful on the
+// connection that created it. When the cache is full the statement is
+// prepared but not kept (cached=false), and the caller closes it after use.
+func (c *conn) prepareServer(sqlText string) (uint32, int, bool, error) {
 	if hit, ok := c.prepared[sqlText]; ok {
-		return hit.id, hit.nparams, nil
+		return hit.id, hit.nparams, true, nil
 	}
 	if c.closed {
-		return 0, 0, fmt.Errorf("skaidb: connection closed")
+		return 0, 0, false, fmt.Errorf("skaidb: connection closed")
 	}
 	if c.streaming.Load() {
-		return 0, 0, errStreamBusy
+		return 0, 0, false, errStreamBusy
 	}
 	body := []byte(sqlText)
 	req := append([]byte{2}, make([]byte, 0, 4+len(body))...)
 	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
 	req = append(req, body...)
 	if err := c.writeFrame(req); err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	frame, err := c.readFrame()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	}
 	r := &reader{buf: frame}
 	switch r.u8() {
@@ -1023,16 +1134,35 @@ func (c *conn) prepareServer(sqlText string) (uint32, int, error) {
 		id := r.u32()
 		n := int(r.u16())
 		if r.err != nil {
-			return 0, 0, r.err
+			return 0, 0, false, r.err
 		}
-		if len(c.prepared) < 240 {
+		if len(c.prepared) < preparedCacheSize {
 			c.prepared[sqlText] = preparedStmt{id: id, nparams: n}
+			return id, n, true, nil
 		}
-		return id, n, nil
+		return id, n, false, nil
 	case 3: // Error
-		return 0, 0, fmt.Errorf("%w: %s", errUnpreparable, r.text())
+		return 0, 0, false, fmt.Errorf("%w: %s", errUnpreparable, r.text())
 	}
-	return 0, 0, fmt.Errorf("skaidb: unexpected prepare response")
+	return 0, 0, false, fmt.Errorf("skaidb: unexpected prepare response")
+}
+
+// closePrepared frees a prepared statement's server slot (OP_CLOSE),
+// best-effort: a failure only means the slot dies with the connection. A
+// transport failure leaves the socket out of step, so it retires the
+// connection.
+func (c *conn) closePrepared(id uint32) {
+	if c.closed || c.broken.Load() || c.streaming.Load() {
+		return
+	}
+	req := binary.LittleEndian.AppendUint32([]byte{4}, id)
+	if err := c.writeFrame(req); err != nil {
+		c.broken.Store(true)
+		return
+	}
+	if _, err := c.readFrame(); err != nil {
+		c.broken.Store(true)
+	}
 }
 
 // sendPrepared executes a prepared statement with TYPED parameters.

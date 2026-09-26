@@ -29,5 +29,22 @@ jobs:
         run: go vet ./...
       - name: test
         run: go test -race -count=1 ./...
+      - name: conformance suite (prints what it skips)
+        run: go test -count=1 -v -run '^TestConformance' . | grep -Ev '^(=== RUN|    --- PASS)'
       - name: build examples
         run: go build ./...
+
+  conformance-vectors:
+    name: conformance vectors match skaidb.org
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: vendored vectors equal the published copy
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 https://skaidb.org/conformance/vectors.json -o "$RUNNER_TEMP/vectors.json"
+          if ! cmp -s conformance/vectors.json "$RUNNER_TEMP/vectors.json"; then
+            echo "::error::conformance/vectors.json differs from https://skaidb.org/conformance/vectors.json — re-vendor it"
+            diff -u conformance/vectors.json "$RUNNER_TEMP/vectors.json" | head -50 || true
+            exit 1
+          fi
