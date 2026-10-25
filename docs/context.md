@@ -31,8 +31,8 @@ An interrupted statement leaves the connection mid-frame — the reply may
 be half read, or still on its way — so it cannot be reused. The driver
 marks it broken; `database/sql` asks the driver whether a connection is
 valid before every reuse, gets "no", closes it, and dials a fresh one (which
-re-walks the seed list). You never see a poisoned connection, at the cost
-of one dial per cancelled statement.
+goes through the load-balancing connector). You never see a poisoned
+connection, at the cost of one dial per cancelled statement.
 
 ## What happens to the statement
 

@@ -35,7 +35,7 @@ db, err := sql.Open("skaidb", "skaidb://skaidb:secret@localhost:7000/app?consist
 8. [Streaming large results](#streaming-large-results) — and the abandon/drain rule
 9. [Streams: `Subscribe`](#streams-subscribe)
 10. [Context: deadlines and cancellation](#context-deadlines-and-cancellation)
-11. [Connection pooling](#connection-pooling)
+11. [Connection pooling](#connection-pooling) — balancing across members, health ejection, discovery
 12. [Multiple result sets](#multiple-result-sets)
 13. [Errors](#errors)
 14. [Versioning and compatibility](#versioning-and-compatibility)
@@ -77,7 +77,7 @@ The module is a single package with no dependencies. `go mod vendor` works
 as usual; or point a `replace` at a checkout:
 
 ```
-require github.com/porcupin26/skaidb-go v1.1.0
+require github.com/porcupin26/skaidb-go v1.2.0
 replace github.com/porcupin26/skaidb-go => ../skaidb-go
 ```
 
@@ -157,6 +157,14 @@ skaidb://[user[:password]@]host[:port][,host2[:port]...][/database][?option=valu
 | `tls_server_name` | SNI and the name checked against the certificate's SANs. skaidb's own certificates carry `DNS:skaidb`, so the default is right for them and is usually *not* the address you dialled. | `skaidb` |
 | `tls_client_cert`, `tls_client_key` | Paths to a PEM client certificate and its private key, presented in the TLS handshake. Always given together. Enables TLS. | — |
 | `auth_mechanism` | `scram` (password, SCRAM-SHA-256) or `certificate` (the TLS client certificate is the credential; needs `tls_client_cert`/`tls_client_key`). See [certificate login](#certificate-login). | `scram` |
+| `load_balancing` | The member each new pooled connection goes to: `random`, `round_robin` or `least_latency`. See [balancing](#balancing-across-members). | `random` |
+| `discover` | `true`/`1` reads the members from `SHOW ENDPOINTS` (server ≥ 0.327): joiners added, leavers dropped, `resyncing`/`unreachable` members skipped. | `false` |
+| `refresh_interval` | How often discovery re-reads the members (a Go duration: `30s`, `2m`); every 5 s instead while one is not ready. | `60s` |
+| `eject_errors` | Consecutive transport failures that eject a member. | `3` |
+| `eject_latency_factor`, `eject_latency_floor` | A member whose round-trip average is above factor × the other members' median **and** more than floor above it is ejected. Factor `0` disables. | `3`, `50ms` |
+| `eject_backoff`, `eject_backoff_max` | How long an ejection lasts, doubling per repeat up to the max. | `5s`, `60s` |
+| `idle_order` | Only `lifo`, which is what `database/sql` does; `fifo` is refused (see [balancing](#balancing-across-members)). | `lifo` |
+| `read_your_writes` | Only `0`; a window is refused — use a `*sql.Conn` (see [balancing](#balancing-across-members)). | `0` |
 
 Unknown options are ignored; a malformed value (`consistency=eventual`,
 `tls=maybe`, a non-numeric port) makes `sql.Open` itself return the error —
@@ -167,13 +175,15 @@ the driver implements `driver.DriverContext`, so the DSN is parsed when the
 
 skaidb is leaderless: every node serves every statement, so a seed list is
 just "somewhere to land", not a primary to discover. Each time
-`database/sql` opens a connection the driver **shuffles the seeds** and
-dials them in turn until one connects *and authenticates* (a node that
-accepts TCP but is unhealthy does not swallow the attempt). Shuffling spreads
-a pool across the cluster; the seed walk is also how failover works: when a
-connection breaks (`IsValid` fails, see [pooling](#connection-pooling)) the
-pool discards it and the replacement dial may land on another node. If no
-seed answers, the error is
+`database/sql` opens a connection the driver dials the member the
+[balancing policy](#balancing-across-members) picks — by default the seeds
+**in random order** — and walks on to the others until one connects *and
+authenticates* (a node that accepts TCP but is unhealthy does not swallow
+the attempt). That spreads a pool across the cluster, and the walk is also
+how failover works: when a connection breaks (`IsValid` fails, see
+[pooling](#connection-pooling)) the pool discards it and the replacement
+dial may land on another node; a node that keeps failing is ejected and
+tried last. If no member answers, the error is
 `skaidb: no reachable endpoint in [h1:7000 h2:7000]: <last error>`.
 
 ### TLS modes
@@ -226,8 +236,10 @@ More: [docs/dsn.md](docs/dsn.md).
 
 The package registers itself as `"skaidb"` with `database/sql` in `init`.
 Beyond the stdlib surface it exports `Version`, `WithStreaming`,
-`WithConsistency`, `Subscribe`/`Event` and the batch API (`ExecBatch`,
-`ExecBatchConn`, `BatchExecer`).
+`WithConsistency`, `Subscribe`/`Event`, the batch API (`ExecBatch`,
+`ExecBatchConn`, `BatchExecer`) and the balancing connector
+(`NewConnector`, `Connector`, `Option` and its constructors, `Policy`,
+`MemberInfo`).
 
 ### `Version`
 
@@ -319,6 +331,52 @@ total affected-row count; see [batches](#batches-and-transactions).
 `BatchExecer` is implemented by the driver's `driver.Conn`, reachable through
 `(*sql.Conn).Raw`; the two functions wrap that.
 
+### `NewConnector`, `Connector` and `Option`
+
+```go
+func NewConnector(dsn string, opts ...Option) (*Connector, error)
+
+func (c *Connector) Connect(ctx context.Context) (driver.Conn, error)
+func (c *Connector) Driver() driver.Driver
+func (c *Connector) Members() []MemberInfo
+func (c *Connector) Close() error
+
+type Option func(*balance) // opaque: built by the functions below
+func LoadBalancing(p Policy) Option
+func Discover(on bool) Option
+func RefreshInterval(d time.Duration) Option
+func EjectErrors(n int) Option
+func EjectLatencyFactor(f float64) Option
+func EjectLatencyFloor(d time.Duration) Option
+func EjectBackoff(d time.Duration) Option
+func EjectBackoffMax(d time.Duration) Option
+
+type Policy string
+const (
+	Random       Policy = "random"
+	RoundRobin   Policy = "round_robin"
+	LeastLatency Policy = "least_latency"
+)
+
+type MemberInfo struct {
+	Endpoint string        // what the connector dials, host:port
+	Name     string        // the member's own endpoint from SHOW ENDPOINTS; "" until discovered
+	State    string        // ready, ejected, resyncing, unreachable or unlisted
+	Latency  time.Duration // round-trip average; 0 until measured
+	Open     int           // connections open to it
+	Seed     bool          // configured in the DSN
+}
+```
+
+`*Connector` is the `driver.Connector` behind every `*sql.DB` of this driver:
+`sql.Open` builds one from the DSN, `NewConnector` builds one with options
+applied on top of the DSN (they override the query parameters of the same
+name) and keeps it in your hands for `Members()`. Hand it to `sql.OpenDB`;
+`db.Close()` closes it, which stops its background goroutine. Use one
+connector per `*sql.DB`. An invalid option fails `NewConnector` with the
+same error the DSN form fails `sql.Open` with. See
+[balancing](#balancing-across-members).
+
 ### `database/sql` interfaces implemented
 
 For the curious, and for anyone using `driver` types directly:
@@ -326,9 +384,10 @@ For the curious, and for anyone using `driver` types directly:
 | Interface | Notes |
 |---|---|
 | `driver.Driver`, `driver.DriverContext` | `OpenConnector(dsn)` parses the DSN at `sql.Open` (a malformed DSN fails there, nothing is dialled); `Open(dsn)` parses and dials, for code that holds the driver value directly |
-| `driver.Connector` | one seed-list dial per pooled connection; `db.Driver()` returns the registered driver |
+| `driver.Connector`, `io.Closer` | `*Connector`: one dial per pooled connection, to the member the balancing policy picks; `db.Driver()` returns the registered driver; `db.Close()` closes it |
 | `driver.Conn` | `Prepare`, `Close`; `Begin` returns an error (no transactions). Also implements this package's `BatchExecer` (via `(*sql.Conn).Raw`) |
-| `driver.Validator` | retires connections broken mid-statement before the pool reuses them |
+| `driver.Validator` | retires connections broken mid-statement, and connections to a member that left the rotation, before the pool reuses them |
+| `driver.SessionResetter` | turns down an idle connection whose member left the rotation while it sat in the pool, so `database/sql` closes it and uses another |
 | `driver.NamedValueChecker` | accepts any Go value so slices and maps can reach the typed path |
 | `driver.QueryerContext`, `driver.ExecerContext` | the main statement path |
 | `driver.Stmt`, `driver.StmtQueryContext`, `driver.StmtExecContext` | `*sql.Stmt` goes through the same server-prepared, typed path as `db.Exec` with arguments |
@@ -660,11 +719,105 @@ Each pooled connection is a single socket that serialises one request /
 one response; concurrency comes from the pool, not from pipelining. A
 connection broken by a transport error, a cancelled statement or an
 undrainable abandoned stream fails `IsValid` and is closed by the pool
-before the next checkout; the replacement dial re-walks the seed list. When
+before the next checkout; the replacement dial goes through the
+[balancing](#balancing-across-members) connector. When
 the request had **not** reached the wire, the driver returns
 `driver.ErrBadConn` and `database/sql` retries the statement on a fresh
 connection transparently; when it had, the error is surfaced (see
 [Errors](#errors)) because a retry could double-apply a write.
+
+### Balancing across members
+
+The connector spreads the pool's connections across the cluster's members by
+the rules every skaidb driver shares
+([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)).
+`database/sql` owns the pool — it keeps the idle connections and picks which
+one serves a statement — so the balancing acts where a driver can: on the
+member **each new connection** is dialled to, and on which connections may
+stay in the pool.
+
+```go
+c, err := skaidb.NewConnector("skaidb://app:pw@db1,db2,db3/app",
+	skaidb.LoadBalancing(skaidb.LeastLatency), // or skaidb.RoundRobin
+	skaidb.Discover(true),                     // learn the members from the cluster
+)
+if err != nil {
+	return err
+}
+db := sql.OpenDB(c)
+defer db.Close()
+db.SetConnMaxLifetime(10 * time.Minute) // keep re-dialling, so the spread follows the cluster
+```
+
+The same through the DSN alone:
+`sql.Open("skaidb", "skaidb://app:pw@db1,db2,db3/app?load_balancing=least_latency&discover=true")`.
+
+| Option (DSN / Go) | Default | What it does |
+|---|---|---|
+| `load_balancing` / `LoadBalancing` | `random` | `random`: a new connection dials the usable members in random order and stays on the one it reached. `round_robin`: new connections go to the usable members in turn, in endpoint order. `least_latency`: of two usable members picked at random, the one with the lower round-trip average × (open connections + 1); a member not measured in the last 2 s scores 0, so it is tried and a quiet pool keeps re-measuring every member. |
+| `discover` / `Discover` | off | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) on the first connection to each member not yet named, and every `refresh_interval` after (every 5 s while a member is `resyncing` or `unreachable`). New members are added, members that left are dropped (a seed is kept, marked `unlisted`), and only `ready` members get new connections; a member back to `ready` starts with a fresh average. A seed given as a host name is matched to the endpoint the server reports. A standalone server (no rows) or an older one (an error) leaves the seeds as they are, and the connector stops asking. |
+| `refresh_interval` / `RefreshInterval` | 60 s | How often discovery re-reads the members. |
+| `eject_errors` / `EjectErrors` | 3 | Consecutive transport failures that eject a member: a failed dial, an I/O error or a deadline mid-statement, a capacity refusal. Statement errors, refused logins, a cancelled context and this side's problems (an unreadable TLS file, a session database the server refuses) do not count. |
+| `eject_latency_factor`, `eject_latency_floor` / `EjectLatencyFactor`, `EjectLatencyFloor` | 3, 50 ms | With at least 10 round trips on it and on another usable member, a member whose average is above factor × the other usable members' median **and** more than floor above it is ejected. Factor 0 disables. |
+| `eject_backoff`, `eject_backoff_max` / `EjectBackoff`, `EjectBackoffMax` | 5 s, 60 s | How long an ejection lasts, doubled per repeat up to the max; a member healthy for the max after a re-admission starts over. When it is up, a background goroutine dials the member alone and runs one statement: success re-admits it with a fresh average, failure ejects it again. **The last usable member is never ejected.** |
+
+The round-trip average is per member: each statement's time from sending
+the request to the first response frame moves it 5 % of the way, and no
+sample counts for more than 10 × the larger of the average and the floor —
+one slow statement barely moves it, a member that stays slow is ejected
+within a few dozen statements.
+
+**What happens to existing connections.** A connection whose member is
+ejected, reported not ready, or dropped from the listing fails `IsValid`
+when it is returned and is turned down by `ResetSession` when the pool
+offers it again, so `database/sql` closes it and dials a replacement through
+the connector. A connection checked out at that moment (a `*sql.Conn`, an
+open `Rows`) keeps working until it is returned. When no member is usable
+at all, connections are kept: closing them would only re-dial the same
+members.
+
+**Which connection serves a statement is `database/sql`'s choice.** It
+hands out the most recently returned idle connection first; there is no
+`fifo` idle order (the DSN refuses `idle_order=fifo`). To keep every member
+in use and keep a server-side idle timeout from finding a connection, let
+connections rotate: `SetConnMaxLifetime` re-dials each connection through
+the policy after a while, `SetConnMaxIdleTime` closes the ones a quiet pool
+does not need.
+
+**Read-your-writes.** The member that coordinated a write reads it back at
+any consistency, `ONE` included; another member may not have applied it yet.
+`database/sql` gives no say over which pooled connection the next statement
+gets, so the driver has no `read_your_writes` window (the DSN refuses one).
+Run the write and the reads that must see it on one `*sql.Conn` — it stays
+on the member that took the write:
+
+```go
+conn, err := db.Conn(ctx)
+if err != nil {
+	return err
+}
+defer conn.Close()
+if _, err := conn.ExecContext(ctx, "INSERT INTO notes (id, body) VALUES (?, ?)", id, body); err != nil {
+	return err
+}
+// Same connection, same member: sees the insert even at consistency ONE.
+err = conn.QueryRowContext(skaidb.WithConsistency(ctx, "one"),
+	"SELECT body FROM notes WHERE id = ?", id).Scan(&body)
+```
+
+**Watching it.** `c.Members()` reports each member as the connector sees it:
+
+```go
+for _, m := range c.Members() {
+	fmt.Printf("%s %-11s %v open=%d seed=%v name=%s\n", m.Endpoint, m.State, m.Latency, m.Open, m.Seed, m.Name)
+}
+```
+
+`State` is `ready`, `ejected`, `resyncing`, `unreachable` or `unlisted`.
+`Open` counts the member's connections, idle or in use (`db.Stats()` has the
+pool-wide split). Keep the `*Connector` from `NewConnector` to call it;
+`database/sql` does not hand back the connector of a `*sql.DB` opened with
+`sql.Open`.
 
 ## Multiple result sets
 
@@ -700,6 +853,8 @@ sentinels.
 | no seed reachable | `skaidb: no reachable endpoint in [seeds]: <last error>` |
 | TLS | `skaidb: TLS handshake failed: …`, `skaidb: cannot read tls_ca "…"`, `skaidb: no certificates found in tls_ca "…"`, `skaidb: cannot load tls_client_cert/tls_client_key: …` |
 | certificate options | `skaidb: tls_client_cert and tls_client_key go together`, `skaidb: auth_mechanism=certificate needs tls_client_cert and tls_client_key`, `skaidb: bad auth_mechanism "…"` — from `sql.Open` |
+| balancing options | `skaidb: bad load_balancing "…"`, `skaidb: bad discover "…"`, `skaidb: bad refresh_interval "…"` (and the other durations), `skaidb: eject_errors must be at least 1, got N`, `skaidb: idle_order=fifo is not available: …`, `skaidb: read_your_writes is not available: …` — from `sql.Open` or `NewConnector` |
+| `Connect` after the connector was closed | `skaidb: connector is closed` |
 | authentication | `skaidb: authentication denied: <reason>`, `skaidb: server signature mismatch (mutual auth failed)` |
 | the server rejected the statement (syntax, missing table, constraint, permission, budget…) | `skaidb: <server message>` |
 | batches | `skaidb: batch row N: statement expects K parameters, got M`, `skaidb: batch row N is B bytes, over the L-byte frame limit`, `skaidb: <server message> (row numbers count from batch row N; the N rows before it applied)` |
@@ -731,8 +886,10 @@ More: [docs/errors.md](docs/errors.md).
   streaming opcode (older servers answer a buffered result), the Hello
   self-identification (server ≥ 0.203.0) is best-effort and ignored where
   unknown, `ExecBatch` needs server ≥ 0.87.0 (older servers get one
-  statement per row), and certificate login needs a server with the
-  EXTERNAL mechanism and `auth.x509_enabled`. Multiple result sets and `RETURNING` are server features the
+  statement per row), certificate login needs a server with the
+  EXTERNAL mechanism and `auth.x509_enabled`, and member discovery needs
+  `SHOW ENDPOINTS` (server ≥ 0.327; older and standalone servers keep the
+  seed list). Multiple result sets and `RETURNING` are server features the
   driver merely passes through. Developed against skaidb 0.290.
 - The version the driver reports in Hello is [`Version()`](#version), always
   equal to the module version in your `go.mod`.

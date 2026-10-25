@@ -19,12 +19,20 @@ stable within the 1.x line.
 | `skaidb: tls_client_cert and tls_client_key go together` | only one of the two given |
 | `skaidb: auth_mechanism=certificate needs tls_client_cert and tls_client_key` | certificate login without a certificate |
 | `skaidb: bad auth_mechanism "…"` | not `scram` or `certificate` |
+| `skaidb: bad load_balancing "…" (use random, round_robin or least_latency)` | unknown policy (also from `NewConnector` with `LoadBalancing`) |
+| `skaidb: bad discover "…"` | not a boolean |
+| `skaidb: bad refresh_interval "…" (a duration such as 5s or 50ms)` | not a Go duration; likewise `eject_latency_floor`, `eject_backoff`, `eject_backoff_max`, `read_your_writes` |
+| `skaidb: bad eject_errors "…"`, `skaidb: bad eject_latency_factor "…"` | not a number |
+| `skaidb: eject_errors must be at least 1, got N`, `skaidb: eject_latency_factor must be a finite number >= 0 …`, `skaidb: refresh_interval must be positive …`, `skaidb: eject_backoff and eject_backoff_max must be positive …`, `skaidb: eject_latency_floor must not be negative …` | out of range (also from `NewConnector` options) |
+| `skaidb: idle_order=fifo is not available: …` | `database/sql` owns the idle order (lifo); `skaidb: bad idle_order "…"` for any other value |
+| `skaidb: read_your_writes is not available: …` | a non-zero window; use one `*sql.Conn` for the write and its reads |
 
 ## From the first statement on a connection (dial)
 
 | Message | Cause |
 |---|---|
-| `skaidb: no reachable endpoint in [seeds]: <last error>` | every seed failed; the wrapped error is the last seed's |
+| `skaidb: no reachable endpoint in [members]: <last error>` | every member tried failed; the wrapped error is the last one's |
+| `skaidb: connector is closed` | `Connect` on a `*Connector` after `Close` (`db.Close()` closes it) |
 | `skaidb: connect failed: …` | TCP (wrapped in the above) |
 | `skaidb: TLS handshake failed: …` | certificate not trusted, name mismatch (`tls_server_name`), plaintext server, or `client_tls = required` on a plaintext dial |
 | `skaidb: cannot read tls_ca "…"`, `skaidb: no certificates found in tls_ca "…"` | the CA file |
@@ -65,7 +73,10 @@ stable within the 1.x line.
 
 "Retired" means the driver reports the connection invalid and
 `database/sql` closes it before the next checkout; the replacement dial
-walks the seed list, which is where failover to another node happens.
+walks the members, which is where failover to another node happens. A
+transport failure (or an expired deadline, not a cancellation) also counts
+against the member; enough in a row eject it for a while (see
+[dsn.md](dsn.md#load-balancing)).
 
 ## Errors during a stream
 

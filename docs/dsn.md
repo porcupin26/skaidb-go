@@ -25,19 +25,54 @@ fine: `node1,node2:7001,[::1]`.
 skaidb is leaderless, so a seed is only "somewhere to land". For each new
 pooled connection the driver:
 
-1. shuffles the list,
-2. dials the seeds in that order with a 10 s TCP timeout each,
+1. orders the members: the one the [load-balancing](#load-balancing)
+   policy picks first (with the default `random` policy, none), the other
+   usable members in random order, then the members that are not usable
+   (resyncing or unreachable before ejected);
+2. dials them in that order with a 10 s TCP timeout each;
 3. returns the first one that connects **and** authenticates (a node that
-   accepts TCP but fails the handshake is skipped),
+   accepts TCP but fails the handshake is skipped);
 4. otherwise fails with `skaidb: no reachable endpoint in [...]: <last error>`.
 
 Failover follows from that. When a connection breaks, `database/sql` drops
-it (the driver reports it invalid) and the next dial walks the seeds again.
+it (the driver reports it invalid) and the next dial walks the members
+again; a member that keeps failing is ejected for a while and tried last.
 A `SetConnMaxLifetime` on the pool makes the spread across nodes recover on
 its own after an outage.
 
 List several nodes in production. A single DNS name that resolves to several
 addresses does **not** get the same treatment: `net.Dial` picks one address.
+
+## Load balancing
+
+The pool is spread across the cluster's members by the rules every skaidb
+driver shares
+([PROTOCOL.md §6.1](https://skaidb.org/docs/PROTOCOL.html#61-balancing-a-pool-across-members)).
+`database/sql` decides which open connection serves a statement; these
+options decide which member each **new** connection goes to and when a
+connection is retired. The same settings exist as Go options on
+`skaidb.NewConnector` (README, "Balancing across members"), which override
+the DSN.
+
+| Option | Default | Effect |
+|---|---|---|
+| `load_balancing` | `random` | `random`: the usable members in random order. `round_robin`: the next usable member in endpoint order. `least_latency`: of two usable members picked at random, the one with the lower round-trip average × (open connections + 1); one not measured in the last 2 s scores 0 |
+| `discover` | `false` | `true`/`1`: read the members with `SHOW ENDPOINTS` (server ≥ 0.327) on the first connection to each member not yet named and every `refresh_interval` after. Joiners are added, leavers dropped (seeds are kept, as `unlisted`), only `ready` members get new connections. No rows (standalone) or an error (older server): the seeds stay and the driver stops asking |
+| `refresh_interval` | `60s` | discovery's period; every 5 s while a member is `resyncing` or `unreachable` |
+| `eject_errors` | `3` | consecutive transport failures (failed dial, I/O error or deadline mid-statement, capacity refusal) that eject a member; statement errors and refused logins do not count |
+| `eject_latency_factor` | `3` | eject a member whose average exceeds this × the other members' median (after 10 round trips on it and on another member); `0` disables |
+| `eject_latency_floor` | `50ms` | … and is also more than this above the median |
+| `eject_backoff` | `5s` | how long an ejection lasts; doubled per repeat. A background probe re-admits the member afterwards. The last usable member is never ejected |
+| `eject_backoff_max` | `60s` | the cap on the doubling; a member healthy this long after re-admission starts over |
+| `idle_order` | `lifo` | the order `database/sql` uses; `fifo` is refused because the driver cannot provide it — use `SetConnMaxIdleTime` / `SetConnMaxLifetime` to keep connections rotating |
+| `read_your_writes` | `0` | a window is refused: `database/sql` picks the connection per statement. Run a write and the reads that must see it on one `*sql.Conn` from `db.Conn(ctx)`; it stays on the member that took the write |
+
+Durations are Go durations (`500ms`, `30s`, `2m`); a bare number is
+refused.
+
+```
+skaidb://app:s3cret@db1,db2,db3/orders?load_balancing=least_latency&discover=true
+```
 
 ## Session database
 
@@ -118,7 +153,13 @@ These fail `sql.Open`:
 - `tls` / `tls_insecure` outside `true|false|1|0`;
 - `tls_client_cert` without `tls_client_key` or the reverse;
 - `auth_mechanism` outside `scram|password|certificate|external|x509`, or
-  `certificate` without a client certificate.
+  `certificate` without a client certificate;
+- `load_balancing` outside `random|round_robin|least_latency`, `discover`
+  not a boolean, a duration option that is not a non-negative Go duration
+  (`refresh_interval`, `eject_backoff` and `eject_backoff_max` must be
+  positive), `eject_errors` below 1, a negative `eject_latency_factor`;
+- `idle_order=fifo` or a non-zero `read_your_writes` (see
+  [load balancing](#load-balancing)).
 
 Unknown options are ignored, so a typo in an option name is not caught.
 

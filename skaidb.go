@@ -123,35 +123,14 @@ func (d *drv) Open(dsn string) (driver.Conn, error) {
 // OpenConnector implements driver.DriverContext. sql.Open calls it once,
 // so the DSN is parsed eagerly and a malformed one fails sql.Open itself
 // rather than the first statement; nothing is dialled here. The returned
-// connector is what the pool dials through from then on.
+// *Connector (balance.go) is what the pool dials through from then on.
 func (d *drv) OpenConnector(dsn string) (driver.Connector, error) {
 	cfg, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	return &connector{cfg: cfg, d: d}, nil
+	return newConnector(cfg, d), nil
 }
-
-// connector is the driver.Connector database/sql holds for the life of a
-// *sql.DB: the parsed DSN plus the driver that produced it.
-type connector struct {
-	cfg config
-	d   *drv
-}
-
-// Connect implements driver.Connector: one seed-list dial per pooled
-// connection. The dial itself has a fixed connect timeout and is not
-// interruptible mid-handshake, so ctx only short-circuits an attempt that
-// is already cancelled when the pool asks.
-func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	return dial(c.cfg)
-}
-
-// Driver implements driver.Connector; it is what db.Driver() returns.
-func (c *connector) Driver() driver.Driver { return c.d }
 
 type config struct {
 	addrs       []string
@@ -171,6 +150,8 @@ type config struct {
 	// certAuth selects the EXTERNAL mechanism (PROTOCOL.md §2.4): the TLS
 	// client certificate is the credential and no password is exchanged.
 	certAuth bool
+	// How a Connector balances the pool across members (balance.go).
+	lb balance
 }
 
 func parseDSN(dsn string) (config, error) {
@@ -280,6 +261,9 @@ func parseDSN(dsn string) (config, error) {
 	if cfg.tlsName == "" {
 		cfg.tlsName = "skaidb"
 	}
+	if cfg.lb, err = parseBalancing(q); err != nil {
+		return config{}, err
+	}
 	return cfg, nil
 }
 
@@ -320,18 +304,18 @@ func tlsWrap(nc net.Conn, cfg config) (net.Conn, error) {
 	} else if cfg.tlsCA != "" {
 		pem, err := os.ReadFile(cfg.tlsCA)
 		if err != nil {
-			return nil, fmt.Errorf("skaidb: cannot read tls_ca %q: %w", cfg.tlsCA, err)
+			return nil, callerFault{fmt.Errorf("skaidb: cannot read tls_ca %q: %w", cfg.tlsCA, err)}
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("skaidb: no certificates found in tls_ca %q", cfg.tlsCA)
+			return nil, callerFault{fmt.Errorf("skaidb: no certificates found in tls_ca %q", cfg.tlsCA)}
 		}
 		tcfg.RootCAs = pool
 	}
 	if cfg.tlsClientCert != "" {
 		pair, err := tls.LoadX509KeyPair(cfg.tlsClientCert, cfg.tlsClientKey)
 		if err != nil {
-			return nil, fmt.Errorf("skaidb: cannot load tls_client_cert/tls_client_key: %w", err)
+			return nil, callerFault{fmt.Errorf("skaidb: cannot load tls_client_cert/tls_client_key: %w", err)}
 		}
 		tcfg.Certificates = []tls.Certificate{pair}
 	}
@@ -374,13 +358,65 @@ type conn struct {
 	// database/sql runs one statement at a time per connection, so a plain
 	// field is enough.
 	stmtLevel byte
+	// The Connector that dialled this connection and the member it reached
+	// (both nil outside one: drv.Open). Told each round trip's latency and
+	// each transport failure, and asked whether the connection may stay in
+	// the pool. Set before database/sql sees the connection, then fixed.
+	lb     *Connector
+	member *member
+	// Set by the context watcher when the caller cancelled: the I/O error
+	// that follows is the caller's doing, not a member failure.
+	cancelled atomic.Bool
 }
 
-// IsValid implements driver.Validator: database/sql asks before handing a
-// pooled connection out again, so a socket broken by a transport error is
-// discarded instead of failing the next caller. The replacement is dialled
-// through Open, which walks the seed list — that is where failover happens.
-func (c *conn) IsValid() bool { return !c.closed && !c.broken.Load() }
+// IsValid implements driver.Validator: database/sql asks before putting a
+// connection back into the pool, so a socket broken by a transport error is
+// discarded instead of failing the next caller — and so is a connection
+// whose member the Connector has ejected, seen not ready or dropped. The
+// replacement is dialled through the Connector, which walks the members —
+// that is where failover and rebalancing happen.
+func (c *conn) IsValid() bool {
+	return !c.closed && !c.broken.Load() && (c.lb == nil || c.lb.keep(c))
+}
+
+// ResetSession implements driver.SessionResetter: database/sql calls it
+// before reusing an idle connection, so one whose member left the rotation
+// while it sat idle is closed (driver.ErrBadConn) instead of handed out, and
+// the statement runs on another connection.
+func (c *conn) ResetSession(ctx context.Context) error {
+	if !c.IsValid() {
+		return driver.ErrBadConn
+	}
+	return nil
+}
+
+// roundTrip writes one request frame and reads the first frame of its
+// answer; sent reports whether the request reached the wire. The time
+// between the two is the round trip a balancing Connector averages per
+// member, and a transport failure counts against the member.
+func (c *conn) roundTrip(req []byte) (frame []byte, sent bool, err error) {
+	start := time.Now()
+	if err := c.writeFrame(req); err != nil {
+		c.observeFailure()
+		return nil, false, err
+	}
+	if frame, err = c.readFrame(); err != nil {
+		c.observeFailure()
+		return nil, true, err
+	}
+	if c.lb != nil {
+		c.lb.observe(c.member, time.Since(start))
+	}
+	return frame, true, nil
+}
+
+// observeFailure tells the Connector a transport failure hit this
+// connection's member, unless the caller's own cancellation caused it.
+func (c *conn) observeFailure() {
+	if c.lb != nil && !c.cancelled.Load() {
+		c.lb.failed(c.member)
+	}
+}
 
 // transportErr classifies a mid-statement I/O failure.
 //
@@ -420,9 +456,23 @@ func dial(cfg config) (*conn, error) {
 }
 
 func dialOne(cfg config, addr string) (*conn, error) {
-	nc, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	return dialOneDeadline(cfg, addr, time.Time{})
+}
+
+// dialOneDeadline is dialOne with a deadline on the whole dial — TCP, TLS,
+// handshake, USE — left set on the connection (the Connector's probes and
+// discovery refreshes, which must not hang). A zero deadline is none.
+func dialOneDeadline(cfg config, addr string, deadline time.Time) (*conn, error) {
+	timeout := 10 * time.Second
+	if !deadline.IsZero() {
+		timeout = min(timeout, time.Until(deadline))
+	}
+	nc, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("skaidb: connect failed: %w", err)
+	}
+	if !deadline.IsZero() {
+		_ = nc.SetDeadline(deadline)
 	}
 	if tcp, ok := nc.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
@@ -454,6 +504,11 @@ func dialOne(cfg config, addr string) (*conn, error) {
 	if cfg.database != "" {
 		if _, err := c.exec(`USE "` + strings.ReplaceAll(cfg.database, `"`, `""`) + `"`); err != nil {
 			nc.Close()
+			if !c.broken.Load() {
+				// The server refused the database: the caller's problem,
+				// not the member's.
+				err = callerFault{err}
+			}
 			return nil, err
 		}
 	}
@@ -584,7 +639,7 @@ func scramProof(password string, salt []byte, iterations uint32, authMessage []b
 // verified: TLS already authenticated the server.
 func (c *conn) handshakeCertificate(user string) error {
 	if _, ok := c.nc.(*tls.Conn); !ok {
-		return fmt.Errorf("skaidb: certificate authentication needs TLS with a client certificate")
+		return callerFault{fmt.Errorf("skaidb: certificate authentication needs TLS with a client certificate")}
 	}
 	return c.externalAuth(user)
 }
@@ -629,6 +684,9 @@ func (c *conn) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.lb != nil {
+		c.lb.released(c.member)
+	}
 	return c.nc.Close()
 }
 
@@ -848,6 +906,9 @@ func (c *conn) applyContext(ctx context.Context) func(error) error {
 	go func() {
 		select {
 		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				c.cancelled.Store(true)
+			}
 			c.broken.Store(true)
 			_ = c.nc.SetDeadline(time.Now())
 		case <-done:
@@ -1121,10 +1182,7 @@ func (c *conn) prepareServer(sqlText string) (uint32, int, bool, error) {
 	req := append([]byte{2}, make([]byte, 0, 4+len(body))...)
 	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
 	req = append(req, body...)
-	if err := c.writeFrame(req); err != nil {
-		return 0, 0, false, err
-	}
-	frame, err := c.readFrame()
+	frame, _, err := c.roundTrip(req)
 	if err != nil {
 		return 0, 0, false, err
 	}
@@ -1156,11 +1214,7 @@ func (c *conn) closePrepared(id uint32) {
 		return
 	}
 	req := binary.LittleEndian.AppendUint32([]byte{4}, id)
-	if err := c.writeFrame(req); err != nil {
-		c.broken.Store(true)
-		return
-	}
-	if _, err := c.readFrame(); err != nil {
+	if _, _, err := c.roundTrip(req); err != nil {
 		c.broken.Store(true)
 	}
 }
@@ -1184,12 +1238,9 @@ func (c *conn) sendPrepared(id uint32, args []driver.NamedValue) (*reader, error
 		req = binary.LittleEndian.AppendUint32(req, uint32(len(vb)))
 		req = append(req, vb...)
 	}
-	if err := c.writeFrame(req); err != nil {
-		return nil, c.transportErr(err, false)
-	}
-	frame, err := c.readFrame()
+	frame, sent, err := c.roundTrip(req)
 	if err != nil {
-		return nil, c.transportErr(err, true)
+		return nil, c.transportErr(err, sent)
 	}
 	return &reader{buf: frame}, nil
 }
@@ -1206,12 +1257,9 @@ func (c *conn) sendQuery(sqlText string) (*reader, error) {
 	req = append(req, 1, c.stmtLevel)
 	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
 	req = append(req, body...)
-	if err := c.writeFrame(req); err != nil {
-		return nil, c.transportErr(err, false)
-	}
-	frame, err := c.readFrame()
+	frame, sent, err := c.roundTrip(req)
 	if err != nil {
-		return nil, c.transportErr(err, true)
+		return nil, c.transportErr(err, sent)
 	}
 	return &reader{buf: frame}, nil
 }
@@ -1409,12 +1457,9 @@ func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
 	req = append(req, 5, c.stmtLevel) // OP_QUERY_STREAM
 	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
 	req = append(req, body...)
-	if err := c.writeFrame(req); err != nil {
-		return nil, c.transportErr(err, false)
-	}
-	frame, err := c.readFrame()
+	frame, sent, err := c.roundTrip(req)
 	if err != nil {
-		return nil, c.transportErr(err, true)
+		return nil, c.transportErr(err, sent)
 	}
 	r := &reader{buf: frame}
 	switch r.u8() {
@@ -1477,6 +1522,7 @@ func (r *rows) fill() error {
 		frame, err := r.c.readFrame()
 		if err != nil {
 			r.endStream()
+			r.c.observeFailure()
 			return r.c.transportErr(err, true)
 		}
 		rd := &reader{buf: frame}

@@ -4,6 +4,37 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.2.0] — 2026-10-25
+
+### Added
+- **Pool load balancing across members** (the rules every skaidb driver
+  shares, PROTOCOL.md §6.1), in the connector `database/sql` dials through:
+  `load_balancing=round_robin` / `least_latency` (power of two choices on
+  the round-trip average × open connections; `random` stays the default)
+  for the member each new connection goes to; health ejection (consecutive
+  transport failures, or a latency average far above the other members')
+  with a background probe that re-admits the member; and `discover=true`
+  (members from `SHOW ENDPOINTS`, server ≥ 0.327: joiners added, leavers
+  dropped, resyncing/unreachable members skipped). Tuned with
+  `refresh_interval`, `eject_errors`, `eject_latency_factor`,
+  `eject_latency_floor`, `eject_backoff` and `eject_backoff_max`.
+- `NewConnector(dsn, opts...)` with the same settings as Go options
+  (`LoadBalancing`, `Discover`, `RefreshInterval`, `EjectErrors`,
+  `EjectLatencyFactor`, `EjectLatencyFloor`, `EjectBackoff`,
+  `EjectBackoffMax`) for `sql.OpenDB`, and `(*Connector).Members()`, which
+  reports each member's state, latency and open connections. The exported
+  `*Connector` is also what `sql.Open` builds; `db.Close()` closes it.
+
+### Changed
+- A connection whose member is ejected, reported not ready or dropped from
+  the listing is retired: it fails `IsValid` when returned to the pool, and
+  the connection now implements `driver.SessionResetter`, which turns it
+  down when the pool offers it again, so `database/sql` dials a replacement.
+- The DSN refuses the two shared options `database/sql` leaves no room for,
+  rather than ignoring them: `idle_order=fifo` (`database/sql` hands out
+  the most recently returned connection first) and a non-zero
+  `read_your_writes` (run a write and its reads on one `*sql.Conn`).
+
 ## [1.1.0] — 2026-09-26
 
 ### Added

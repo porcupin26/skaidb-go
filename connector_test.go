@@ -76,7 +76,7 @@ func TestOpenConnectorKeepsParsedConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cn, ok := c.(*connector)
+	cn, ok := c.(*Connector)
 	if !ok {
 		t.Fatalf("OpenConnector returned %T", c)
 	}

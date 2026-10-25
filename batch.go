@@ -197,14 +197,14 @@ var errNoBatch = errors.New("skaidb: server does not support batches")
 // is already applied, which the errors say. fallback reports an
 // "unknown opcode" answer to the first chunk.
 func (c *conn) sendBatchChunk(req []byte, start int) (int64, bool, error) {
-	if err := c.writeFrame(req); err != nil {
+	frame, sent, err := c.roundTrip(req)
+	if err != nil && !sent {
 		if start > 0 {
 			return 0, false, fmt.Errorf("skaidb: batch rows from %d not sent (the %d rows before them applied): %w",
 				start, start, c.transportErr(err, true))
 		}
 		return 0, false, c.transportErr(err, false)
 	}
-	frame, err := c.readFrame()
 	if err != nil {
 		err = c.transportErr(err, true)
 		if start > 0 {

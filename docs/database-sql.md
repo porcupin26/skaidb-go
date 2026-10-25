@@ -15,8 +15,26 @@ db.SetConnMaxLifetime(30 * time.Minute) // recycle: rebalances across seeds over
 ```
 
 Recycling connections periodically (`SetConnMaxLifetime`) is worth doing on
-a cluster: every new dial shuffles the seed list, so the pool drifts back to
-an even spread after a node was down.
+a cluster: every new dial goes through the load-balancing policy (by default
+the members in random order), so the pool drifts back to an even spread
+after a node was down. `database/sql` hands out the most recently returned
+idle connection first; `SetConnMaxIdleTime` closes the ones a quiet pool
+does not need.
+
+To choose the policy, enable member discovery or tune health ejection, set
+the DSN options ([dsn.md](dsn.md#load-balancing)) or build the pool from a
+connector, which also reports the members:
+
+```go
+c, err := skaidb.NewConnector(dsn, skaidb.LoadBalancing(skaidb.RoundRobin), skaidb.Discover(true))
+if err != nil {
+	return err
+}
+db := sql.OpenDB(c) // db.Close() closes c
+for _, m := range c.Members() {
+	log.Printf("%s %s %v open=%d", m.Endpoint, m.State, m.Latency, m.Open)
+}
+```
 
 ## `ExecContext`
 
@@ -83,6 +101,14 @@ arguments takes. See [prepared-statements.md](prepared-statements.md).
 stay on one socket: a batch on one prepared statement, or a `USE` followed by
 statements that depend on it (prefer the DSN path for the session database —
 it is applied to every pooled connection, `USE` through `Exec` is not).
+
+It is also how to **read your own writes** at a weak consistency: the member
+that coordinated a write reads it back at any level, `ONE` included, and a
+`*sql.Conn` stays on one member. Run the write and the reads that must see
+it on the same `*sql.Conn`; through the `*sql.DB` the next statement may
+land on another member that has not applied the write yet. A pinned
+connection whose member is ejected meanwhile keeps working until you close
+it; the pool then discards it.
 
 `conn.Raw(func(driverConn any) error { … })` exposes the driver's
 connection, which implements `skaidb.BatchExecer`: one statement over many
