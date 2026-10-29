@@ -77,7 +77,7 @@ The module is a single package with no dependencies. `go mod vendor` works
 as usual; or point a `replace` at a checkout:
 
 ```
-require github.com/porcupin26/skaidb-go v1.2.0
+require github.com/porcupin26/skaidb-go v1.3.0
 replace github.com/porcupin26/skaidb-go => ../skaidb-go
 ```
 
@@ -273,9 +273,19 @@ if err != nil { return err }
 defer rows.Close() // mandatory
 ```
 
-Parameters are **not** supported on this path (the streaming opcode carries
-SQL text only); a query with arguments takes the buffered path silently.
-Falls back to a buffered query against a server too old for the opcode.
+Arguments bind `?` placeholders exactly as on any other query — typed,
+arrays and documents included — and travel in the streamed request itself
+(`OP_QUERY_STREAM_PARAMS`, server ≥ 0.330):
+
+```go
+rows, err := db.QueryContext(skaidb.WithStreaming(ctx),
+    "SELECT id, ts, body FROM events WHERE ts >= ? AND ts < ?", from, to)
+```
+
+Without arguments the request is the original streaming opcode, which every
+server knows. Against a server too old for the request a call needs (the
+streaming opcode, or the parameterised form before 0.330) the call falls
+back to a buffered query: it still works, but is not streamed.
 
 ### `WithConsistency`
 
@@ -578,8 +588,9 @@ A plain `SELECT` is materialised on the coordinator and bounded by the
 server's scan budgets (rows examined and bytes), which **error** rather than
 truncate. To read a big table, stream it: `WithStreaming(ctx)` sends the
 streaming opcode and the rows arrive as chunks that `rows.Next` pulls on
-demand, so the client holds one chunk at a time and the server pages a
-simple scan in per-page statements, each with a fresh budget.
+demand, so the client holds one chunk at a time. The server executes a
+plain `SELECT` page by page, and no scan budget applies to a streamed page
+(server ≥ 0.330).
 
 ```go
 rows, err := db.QueryContext(skaidb.WithStreaming(ctx), "SELECT id, payload FROM events")
@@ -596,9 +607,12 @@ return rows.Err()
 
 Rules of the streaming path:
 
-- **No parameters.** The streaming opcode carries SQL text; a call with
-  arguments silently takes the buffered path. Interpolate values yourself
-  only from trusted input, or filter server-side by other means.
+- **Arguments bind as on any query.** `?` placeholders take typed
+  arguments — arrays and documents included — carried by the streaming
+  request itself (`OP_QUERY_STREAM_PARAMS`, server ≥ 0.330), so a bounded
+  export needs no values written into its SQL:
+  `db.QueryContext(skaidb.WithStreaming(ctx), "SELECT id, ts FROM events WHERE ts >= ?", since)`.
+  An older server answers a call with arguments with a buffered result.
 - **The rows own the connection** until `Close`. `database/sql` pins the
   `*sql.Conn` for the rows' lifetime, and if two goroutines share one
   `*sql.Conn` the second statement fails with `skaidb: connection is busy
@@ -606,14 +620,15 @@ Rules of the streaming path:
   statement` rather than interleaving on the socket.
 - **The context must outlive the iteration.** Its deadline covers the whole
   stream; cancelling it interrupts the stream and retires the connection.
-- **Server-side paging applies to simple scans.** On a cluster the server's
-  keyset lane pages a bare `SELECT cols FROM t [WHERE simple predicate]` on
-  its primary key; `LIMIT`/`OFFSET`, `DISTINCT`, `JOIN`, `GROUP BY`, set
-  operations and predicates with functions or subqueries make it fall back
-  to a single materialised statement (still delivered in chunks, but subject
-  to the budgets). Name your columns: a lone `SELECT *` on a cluster needs
-  `WithConsistency(ctx, "one")` for the paged lane, because the wildcard's
-  column discovery reads the local shard.
+- **Server-side paging applies to plain selects.** A `SELECT` of bare
+  columns (or a lone `*`) from one table, filtered by any function of the
+  row, unordered or in storage-key order, is paged, and a bound argument
+  pages like the literal it stands for. Joins, `GROUP BY` and aggregates,
+  `DISTINCT`, set operations, `LIMIT`/`OFFSET`, other orderings, searches
+  and subqueries are materialised first — still delivered in chunks, but
+  subject to the budgets, and a budget error says why the statement could
+  not page. `EXPLAIN` reports which path a statement takes; the server's
+  rules are in [QUERY_SYNTAX, "Streamed queries"](https://skaidb.org/docs/query_syntax.html).
 - **Procedures that `EMIT`** answer in one ordinary multi-set frame even on
   the streaming opcode; they work, but are not streamed.
 
@@ -858,7 +873,7 @@ sentinels.
 | authentication | `skaidb: authentication denied: <reason>`, `skaidb: server signature mismatch (mutual auth failed)` |
 | the server rejected the statement (syntax, missing table, constraint, permission, budget…) | `skaidb: <server message>` |
 | batches | `skaidb: batch row N: statement expects K parameters, got M`, `skaidb: batch row N is B bytes, over the L-byte frame limit`, `skaidb: <server message> (row numbers count from batch row N; the N rows before it applied)` |
-| parameter problems | `skaidb: statement expects N parameters, got M`, `skaidb: more placeholders than parameters`, `skaidb: more parameters than placeholders`, `skaidb: cannot bind value of type T`, `skaidb: cannot bind NaN/Infinity`, `skaidb: document keys must be strings` |
+| parameter problems | `skaidb: statement expects N parameters, got M`, `skaidb: more placeholders than parameters`, `skaidb: more parameters than placeholders`, `skaidb: cannot bind value of type T`, `skaidb: cannot bind NaN/Infinity`, `skaidb: document keys must be strings`, `skaidb: N parameters, over the protocol's 65535` |
 | bad consistency in `WithConsistency` | `skaidb: bad consistency "…"` |
 | transactions | `skaidb: transactions are not supported` |
 | `LastInsertId` | `skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow` |
@@ -883,7 +898,8 @@ More: [docs/errors.md](docs/errors.md).
   7000. It negotiates nothing at connect time; instead each optional feature
   degrades gracefully on an older server: prepared statements need server
   ≥ 0.17.0 (older servers get client-side binding), streaming needs the
-  streaming opcode (older servers answer a buffered result), the Hello
+  streaming opcode and streaming with arguments server ≥ 0.330 (older
+  servers answer a buffered result), the Hello
   self-identification (server ≥ 0.203.0) is best-effort and ignored where
   unknown, `ExecBatch` needs server ≥ 0.87.0 (older servers get one
   statement per row), certificate login needs a server with the

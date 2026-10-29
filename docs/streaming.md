@@ -10,16 +10,18 @@ the streaming request: the rows come back as a header, N chunks and an end
 marker, and `rows.Next` pulls chunks as you go, so the client holds one at a
 time.
 
-On the server, a streamed *simple scan* — `SELECT cols FROM t [WHERE
-simple predicate]` — is paged on the primary key, each page its own
-statement with a fresh budget, so table size stops mattering. Statements
-the pager declines (`LIMIT`/`OFFSET`, `DISTINCT`, `JOIN`, `GROUP BY`,
-`HAVING`, set operations, window functions, `NEAREST`, predicates with
-functions, parameters, aggregates or subqueries) are still delivered in
-chunks but run as one materialised statement under the usual budgets.
-Adding a `LIMIT` "to help" disqualifies the pager. Name your columns: a
-bare `SELECT *` on a cluster needs consistency `one` for the paged lane,
-because the wildcard's column discovery reads the local shard.
+On the server, a streamed *plain* `SELECT` — bare columns (or a lone `*`)
+from one table, filtered by any function of the row, unordered or in
+storage-key order — is executed page by page, and no scan budget applies to
+a streamed page (server ≥ 0.330), so table size stops mattering; a bound
+argument pages like the literal it stands for. Other shapes
+(`LIMIT`/`OFFSET`, `DISTINCT`, joins, `GROUP BY` and aggregates, set
+operations, other orderings, searches, subqueries) are still delivered in
+chunks but run as one materialised statement under the usual budgets, and a
+budget error says why the statement could not page. Adding a `LIMIT` "to
+help" disqualifies the pager. `EXPLAIN` reports which path a statement
+takes; the server's rules are in
+[QUERY_SYNTAX, "Streamed queries"](https://skaidb.org/docs/query_syntax.html).
 
 ## How
 
@@ -47,8 +49,17 @@ return rows.Err() // a server error part-way arrives here
 `WithStreaming` is a context decorator because `database/sql` has no other
 slot for it; it applies to that one `QueryContext` call.
 
-- **No parameters.** The streaming request carries SQL text; a call with
-  arguments silently takes the buffered path.
+- **Arguments bind as on any query** — typed, arrays and documents
+  included — and travel in the streaming request itself
+  (`OP_QUERY_STREAM_PARAMS`, server ≥ 0.330), so a bounded export needs no
+  values written into its SQL:
+
+  ```go
+  rows, err := db.QueryContext(skaidb.WithStreaming(ctx),
+  	"SELECT id, ts, body FROM events WHERE ts >= ? AND ts < ?", from, to)
+  ```
+
+  A stream without arguments sends the original streaming request.
 - **The rows own the connection** until `Close`. The pool pins the
   connection to the rows; a second statement on the same `*sql.Conn` from
   another goroutine fails with `skaidb: connection is busy streaming a
@@ -56,8 +67,9 @@ slot for it; it applies to that one `QueryContext` call.
 - **The context must outlive the loop.** Cancelling it ends the stream and
   retires the connection; the deadline applies to the last chunk as much as
   to the first.
-- **Older servers** that do not know the streaming opcode answer a
-  buffered result; the code above still works.
+- **Older servers** answer a buffered result: a server without the
+  streaming opcode, and, for a call with arguments, a server older than
+  0.330. The code above still works; it is just not streamed.
 - A procedure that `EMIT`s answers with its (buffered) result sets on this
   path too.
 
@@ -95,4 +107,4 @@ Everything the driver does to keep the pool safe hangs off it.
 |---|---|
 | point reads, small filtered reads, aggregates, anything with `LIMIT` | plain `QueryContext` |
 | exports, full-table scans, ETL, anything that might exceed a budget | `WithStreaming` |
-| a parameterised big read | filter server-side by other means (a stream, a view, an interpolated trusted value), or page it yourself with a keyset (`WHERE id > ? ORDER BY id LIMIT n`) on the plain path |
+| a parameterised big read (a time range, one tenant's rows) | `WithStreaming` with the arguments (server ≥ 0.330) |

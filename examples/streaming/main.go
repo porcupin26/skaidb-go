@@ -34,7 +34,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	// The streaming path carries SQL text only: no `?` parameters here.
+	// Arguments bind `?` placeholders as on any query and travel with the
+	// streamed request (server >= 0.330), e.g.
+	//	db.QueryContext(skaidb.WithStreaming(ctx), "SELECT id, name FROM people WHERE id > ?", 1000)
 	rows, err := db.QueryContext(skaidb.WithStreaming(ctx), os.Args[2])
 	if err != nil {
 		log.Fatal(err)

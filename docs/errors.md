@@ -52,6 +52,7 @@ stable within the 1.x line.
 | `skaidb: cannot bind value of type T` | an unsupported argument type (struct, chan…), or a composite on the client-side path |
 | `skaidb: cannot bind NaN/Infinity` | non-finite float |
 | `skaidb: document keys must be strings` | a map with non-string keys |
+| `skaidb: N parameters, over the protocol's 65535` | more arguments than the wire's 16-bit count carries; nothing was sent |
 | `sql: converting argument $N type: …` | `database/sql`'s default converter refused a scalar (e.g. `uint64` above `MaxInt64`) |
 | `skaidb: batch row N: statement expects K parameters, got M` | an `ExecBatch` row of the wrong width; nothing was sent |
 | `skaidb: batch row N is B bytes, over the L-byte frame limit` | one `ExecBatch` row larger than a wire frame |

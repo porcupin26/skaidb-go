@@ -747,9 +747,18 @@ type streamKey struct{}
 //
 //	rows, err := db.QueryContext(skaidb.WithStreaming(ctx), "SELECT ...")
 //
-// Parameters are not supported on this path — the streaming opcode carries
-// SQL text, so bind values yourself or use a parameterless statement. Falls
-// back to a buffered query against a server too old to know the opcode.
+// Arguments bind the statement's "?" placeholders exactly as they do on a
+// buffered query — typed, arrays and documents included — and travel in the
+// streamed request itself (OP_QUERY_STREAM_PARAMS, server >= 0.330), so a
+// bounded export needs no values written into its SQL:
+//
+//	rows, err := db.QueryContext(skaidb.WithStreaming(ctx),
+//		"SELECT id, ts, body FROM events WHERE ts >= ? AND ts < ?", from, to)
+//
+// Without arguments the request is the original streaming opcode, which
+// every server knows. A server too old for the request a call needs (the
+// streaming opcode itself, or the parameterised form before 0.330) answers a
+// buffered result instead: the call still works, it is just not streamed.
 //
 // The rows own the connection until they are closed: another statement on the
 // same *sql.Conn fails with a "busy streaming" error until then.
@@ -949,8 +958,8 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	c.stmtLevel = lvl
 	defer func() { c.stmtLevel = c.consistency }()
 	finish := c.applyContext(ctx)
-	if ctx != nil && ctx.Value(streamKey{}) != nil && len(args) == 0 {
-		rs, err := c.streamQuery(query)
+	if ctx != nil && ctx.Value(streamKey{}) != nil {
+		rs, err := c.streamQuery(query, args)
 		if err == nil {
 			// A stream stays open while the caller iterates, so the deadline
 			// and the cancel watcher must outlive this call — Close ends them.
@@ -959,10 +968,13 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 			}
 			return rs, nil
 		}
-		if !errors.Is(err, errNoStreaming) {
+		if !errors.Is(err, errNoStreaming) && !errors.Is(err, errNoParamStreaming) &&
+			!errors.Is(err, errUnpreparable) {
 			return nil, finish(err)
 		}
-		// fall through to the buffered path
+		// Nothing ran: the server could not decode the request, or could
+		// not bind the arguments into this statement kind. Fall through to
+		// the buffered path, which runs the call as if it were not streamed.
 	}
 	if len(args) > 0 {
 		r, err := c.preparedRoundtrip(query, args)
@@ -1229,6 +1241,24 @@ func (c *conn) sendPrepared(id uint32, args []driver.NamedValue) (*reader, error
 	}
 	req := []byte{3, c.stmtLevel}
 	req = binary.LittleEndian.AppendUint32(req, id)
+	req, err := appendParams(req, args)
+	if err != nil {
+		return nil, err
+	}
+	frame, sent, err := c.roundTrip(req)
+	if err != nil {
+		return nil, c.transportErr(err, sent)
+	}
+	return &reader{buf: frame}, nil
+}
+
+// appendParams appends the typed parameter vector OP_EXECUTE and
+// OP_QUERY_STREAM_PARAMS share: u16 count, then each value's §4 encoding
+// behind its u32 length, in "?" order.
+func appendParams(req []byte, args []driver.NamedValue) ([]byte, error) {
+	if len(args) > math.MaxUint16 {
+		return nil, fmt.Errorf("skaidb: %d parameters, over the protocol's %d", len(args), math.MaxUint16)
+	}
 	req = binary.LittleEndian.AppendUint16(req, uint16(len(args)))
 	for _, a := range args {
 		vb, err := encodeValue(nil, a.Value)
@@ -1238,11 +1268,7 @@ func (c *conn) sendPrepared(id uint32, args []driver.NamedValue) (*reader, error
 		req = binary.LittleEndian.AppendUint32(req, uint32(len(vb)))
 		req = append(req, vb...)
 	}
-	frame, sent, err := c.roundTrip(req)
-	if err != nil {
-		return nil, c.transportErr(err, sent)
-	}
-	return &reader{buf: frame}, nil
+	return req, nil
 }
 
 func (c *conn) sendQuery(sqlText string) (*reader, error) {
@@ -1437,15 +1463,22 @@ type rows struct {
 	release func(error) error
 }
 
-// streamRows issues OP_QUERY_STREAM and returns rows that pull chunks from
+// streamQuery issues OP_QUERY_STREAM and returns rows that pull chunks from
 // the wire as database/sql asks for them, so the client holds one chunk
 // rather than the whole result. database/sql's Rows.Next is already
 // pull-based, so this is a better fit than materialising and walking a
 // slice — which is what the non-streaming path does.
 //
-// Falls back to the buffered path when the server does not know the opcode
-// (older servers answer Error) or when the statement is not row-producing.
-func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
+// With arguments — and only then — the request is OP_QUERY_STREAM_PARAMS
+// instead: the same SQL, then the typed parameter vector OP_EXECUTE carries.
+// A parameterless stream stays the original request, which every server
+// knows.
+//
+// A statement that is not row-producing is answered with one ordinary frame.
+// The errors QueryContext answers with the buffered path instead are
+// errNoStreaming and errNoParamStreaming (a server without the opcode) and
+// errUnpreparable (a statement kind the server binds only as text).
+func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Rows, error) {
 	if c.closed {
 		return nil, fmt.Errorf("skaidb: connection closed")
 	}
@@ -1454,9 +1487,19 @@ func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
 	}
 	body := []byte(sqlText)
 	req := make([]byte, 0, 6+len(body))
-	req = append(req, 5, c.stmtLevel) // OP_QUERY_STREAM
+	if len(args) == 0 {
+		req = append(req, 5, c.stmtLevel) // OP_QUERY_STREAM
+	} else {
+		req = append(req, 9, c.stmtLevel) // OP_QUERY_STREAM_PARAMS
+	}
 	req = binary.LittleEndian.AppendUint32(req, uint32(len(body)))
 	req = append(req, body...)
+	if len(args) > 0 {
+		var err error
+		if req, err = appendParams(req, args); err != nil {
+			return nil, err
+		}
+	}
 	frame, sent, err := c.roundTrip(req)
 	if err != nil {
 		return nil, c.transportErr(err, sent)
@@ -1480,12 +1523,24 @@ func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
 		return &rows{cols: cols, c: c}, nil
 	case 0: // Rows — server chose to answer in one frame
 		return c.readRowsBody(r)
+	case 8: // ResultSets — a CALL whose body EMITted, in one frame
+		return c.readRows(&reader{buf: frame})
 	case 1, 2: // Mutation / Ddl through a streaming call
 		return &rows{cols: []string{}, done: true}, nil
 	case 3:
 		msg := r.text()
 		if strings.Contains(msg, "unknown opcode") {
+			if len(args) > 0 {
+				return nil, fmt.Errorf("%w: %s", errNoParamStreaming, msg)
+			}
 			return nil, errNoStreaming
+		}
+		// Matched whole, never as a substring: it is the server's answer
+		// when binding fails, before anything runs, and a fallback after an
+		// error raised once execution had started would run the statement
+		// a second time.
+		if len(args) > 0 && msg == unbindableKind {
+			return nil, fmt.Errorf("%w: %s", errUnpreparable, msg)
 		}
 		return nil, fmt.Errorf("skaidb: %s", msg)
 	}
@@ -1494,6 +1549,16 @@ func (c *conn) streamQuery(sqlText string) (driver.Rows, error) {
 
 // errNoStreaming marks a server too old to know OP_QUERY_STREAM.
 var errNoStreaming = fmt.Errorf("skaidb: server does not support streaming")
+
+// errNoParamStreaming marks a server too old to know OP_QUERY_STREAM_PARAMS
+// (before 0.330): it still streams a parameterless statement, but cannot
+// carry arguments with one.
+var errNoParamStreaming = errors.New("skaidb: server does not support parameterised streaming (skaidb >= 0.330)")
+
+// unbindableKind is the server's whole answer to arguments sent with a
+// statement kind it does not bind (DDL, session statements): those take the
+// client-side text path, as they do when prepared.
+const unbindableKind = "statement kind cannot be prepared"
 
 // errStreamBusy rejects a statement issued while a streamed result set is
 // still in flight on the same connection. Replies come back in request order,

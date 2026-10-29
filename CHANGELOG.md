@@ -4,6 +4,34 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.3.0] — 2026-10-29
+
+### Added
+- **Parameterised streaming**: `db.QueryContext(skaidb.WithStreaming(ctx),
+  sql, args...)` binds `?` placeholders exactly as a buffered query does —
+  typed, arrays and documents included — and sends them with the streamed
+  request over `OP_QUERY_STREAM_PARAMS` (server ≥ 0.330), so a
+  range-bounded export no longer needs its values written into the SQL; a
+  `*sql.Stmt` run with a streaming context streams the same way. Without
+  arguments the request is the original `OP_QUERY_STREAM`, byte for byte.
+  The conformance harness passes `call.params` to the streaming call (the
+  new `stream_params` case).
+
+### Changed
+- A `WithStreaming` query with arguments streams instead of silently
+  running buffered, so it follows the streaming rules: the rows own the
+  connection until `rows.Close`, and the context must outlive the
+  iteration. Against a server older than 0.330 (which answers the new
+  opcode with an `unknown opcode` error) the call still runs buffered, as a
+  prepared statement, on the same connection; a statement kind the server
+  does not bind (DDL, session statements) still takes the client-side text
+  path.
+
+### Fixed
+- A `CALL` of a procedure that `EMIT`s, run with `WithStreaming`, failed
+  with `skaidb: unexpected response to stream request`; its result sets now
+  arrive through `NextResultSet`, as on the buffered path.
+
 ## [1.2.0] — 2026-10-25
 
 ### Added

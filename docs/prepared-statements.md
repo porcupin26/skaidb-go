@@ -11,7 +11,10 @@ count, and executes with each argument encoded as a typed wire value (tag
 and payload; the encoding is the same one result rows use — see the
 [protocol, §3.3 and §4](https://skaidb.org/docs/PROTOCOL.html)). No SQL
 text is rebuilt on the client, so quoting is never a concern, and arrays and
-documents — which have no literal form — bind naturally.
+documents — which have no literal form — bind naturally. A
+[streamed](streaming.md) query carries the same typed arguments inside its
+streaming request instead, with no prepare step (server ≥ 0.330; an older
+server runs it on this path, buffered).
 
 **Client-side (text).** If the server declines to prepare the statement
 (DDL, `USE`, other session statements), the driver renders each argument as
@@ -72,7 +75,5 @@ The full mapping is in [types.md](types.md).
 
 ## What cannot be parameterised
 
-Identifiers (table and column names), keywords, and the SQL text of the
-[streaming path](streaming.md) (`WithStreaming` sends text only; arguments
-switch it back to a buffered query). Build those into the statement string
-from trusted values.
+Identifiers (table and column names) and keywords. Build those into the
+statement string from trusted values.
