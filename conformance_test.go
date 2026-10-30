@@ -595,6 +595,8 @@ func runCall(t *testing.T, ctx context.Context, c *sql.Conn, cl call, expect map
 		return collect(t, rows)
 	case "query_stream":
 		// With call.params, the parameterised stream (OP_QUERY_STREAM_PARAMS).
+		// collect walks every result set, so a streamed CALL that EMITs (one
+		// ResultSets frame) is compared set by set, as the buffered one is.
 		rows, err := c.QueryContext(WithStreaming(ctx), cl.SQL, toNative(t, cl.Params)...)
 		if err != nil {
 			return callResult{err: err.Error()}
