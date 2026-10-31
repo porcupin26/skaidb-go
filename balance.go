@@ -5,9 +5,11 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,13 +43,18 @@ const (
 )
 
 const (
-	// Latency EWMA: each round trip moves a member's average 5% toward it,
-	// and no sample counts for more than 10× the larger of the current
-	// average and the ejection floor — one slow statement does not eject a
-	// healthy member, a member that stays slow is ejected within a few dozen
-	// statements.
-	ewmaWeight = 0.05
-	ewmaClamp  = 10
+	// Latency EWMA: the fastest of a member's first round trips seeds it (a
+	// round trip is only ever lengthened — by the member, the network or
+	// this process stalling — so a slow first statement cannot set it); then
+	// each round trip moves it 5% toward it, and no sample counts for more
+	// than 10× the larger of the current average and the ejection floor —
+	// one slow statement does not eject a healthy member, a member that
+	// stays slow is ejected within a few dozen statements.
+	ewmaSeedSamples = 3
+	ewmaWeight      = 0.05
+	ewmaClamp       = 10
+	// Round trips a latency ejection's warning reports the slowest of.
+	recentSamples = 10
 	// Round trips a member (and at least one other) needs before its average
 	// can eject it.
 	ewmaMinSamples = 10
@@ -237,6 +244,9 @@ type member struct {
 	canonical    string // its own name in SHOW ENDPOINTS; "" until learned
 	listed       string // ready | resyncing | unreachable | unlisted
 	ewma         time.Duration
+	seeded       bool            // ewma is set; until then the member is not measured
+	firsts       []time.Duration // round trips before the average is seeded
+	recent       []time.Duration // the last recentSamples round trips, oldest first
 	samples      int
 	lastSample   time.Time
 	errors       int       // consecutive transport failures
@@ -253,7 +263,8 @@ func (m *member) usable() bool { return m.ejectedUntil.IsZero() && m.listed == "
 // freshStart forgets a member's latency and errors: a re-admission, or a
 // member back to ready in a listing, is measured afresh.
 func (m *member) freshStart() {
-	m.ewma, m.samples, m.errors = 0, 0, 0
+	m.ewma, m.seeded, m.samples, m.errors = 0, false, 0, 0
+	m.firsts, m.recent = m.firsts[:0], m.recent[:0]
 }
 
 // MemberInfo is one member as Connector.Members reports it.
@@ -452,10 +463,10 @@ func (c *Connector) pick() *member {
 	return usable[j]
 }
 
-// score is LeastLatency's load estimate. A member never measured, or not
-// lately, scores 0: it is tried and measured.
+// score is LeastLatency's load estimate. A member not measured yet (its
+// average not seeded), or not lately, scores 0: it is tried and measured.
 func score(m *member, now time.Time) float64 {
-	if m.samples == 0 || now.Sub(m.lastSample) > staleSample {
+	if !m.seeded || now.Sub(m.lastSample) > staleSample {
 		return 0
 	}
 	return float64(m.ewma) * float64(m.open+1)
@@ -549,59 +560,85 @@ func (c *Connector) released(m *member) {
 // observe folds one round trip into the member's average and ejects a
 // member that stays far slower than the others.
 func (c *Connector) observe(m *member, elapsed time.Duration) {
+	if why := c.fold(m, elapsed); why != "" {
+		warnf("ejecting %s (%s)", m.endpoint, why)
+	}
+}
+
+// fold is observe's work, under c.mu: it returns why it ejected m, or "".
+func (c *Connector) fold(m *member, elapsed time.Duration) string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.members[m.endpoint] != m {
-		return // dropped by discovery meanwhile
+		return "" // dropped by discovery meanwhile
 	}
 	m.errors = 0
-	if m.samples == 0 {
-		m.ewma = elapsed
+	if len(m.recent) < recentSamples {
+		m.recent = append(m.recent, elapsed)
+	} else {
+		copy(m.recent, m.recent[1:])
+		m.recent[recentSamples-1] = elapsed
+	}
+	if !m.seeded {
+		m.firsts = append(m.firsts, elapsed)
+		if len(m.firsts) == ewmaSeedSamples {
+			m.ewma, m.seeded = slices.Min(m.firsts), true
+			m.firsts = m.firsts[:0]
+		}
 	} else {
 		limit := ewmaClamp * max(m.ewma, c.cfg.lb.ejectFloor)
 		m.ewma += time.Duration(ewmaWeight * float64(min(elapsed, limit)-m.ewma))
 	}
 	m.samples++
 	m.lastSample = time.Now()
-	// Only a member still in rotation: round trips finishing on connections
-	// checked out before an ejection must not eject it again.
-	if m.samples < ewmaMinSamples || c.cfg.lb.ejectFactor <= 0 || !m.usable() {
-		return
+	// A seeded average only, of a member still in rotation: round trips
+	// finishing on connections checked out before an ejection must not
+	// eject it again.
+	if !m.seeded || m.samples < ewmaMinSamples || c.cfg.lb.ejectFactor <= 0 || !m.usable() {
+		return ""
 	}
 	var others []time.Duration
 	for _, o := range c.members {
-		if o != m && o.usable() && o.samples >= ewmaMinSamples {
+		if o != m && o.usable() && o.seeded && o.samples >= ewmaMinSamples {
 			others = append(others, o.ewma)
 		}
 	}
 	if len(others) == 0 {
-		return
+		return ""
 	}
 	sort.Slice(others, func(i, j int) bool { return others[i] < others[j] })
 	median := others[(len(others)-1)/2] // the lower middle when even
-	if float64(m.ewma) > c.cfg.lb.ejectFactor*float64(median) && m.ewma-median > c.cfg.lb.ejectFloor {
-		c.eject(m)
+	if float64(m.ewma) > c.cfg.lb.ejectFactor*float64(median) && m.ewma-median > c.cfg.lb.ejectFloor && c.eject(m) {
+		// The slowest recent round trip tells a slow member from one slow
+		// statement.
+		return fmt.Sprintf("latency %.1f ms vs median %.1f ms; slowest of the last %d round trips %.1f ms",
+			millis(m.ewma), millis(median), len(m.recent), millis(slices.Max(m.recent)))
 	}
+	return ""
 }
 
 // failed counts a transport failure against m.
 func (c *Connector) failed(m *member) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.members[m.endpoint] != m {
-		return
+	why := ""
+	if c.members[m.endpoint] == m {
+		m.errors++
+		if m.errors >= c.cfg.lb.ejectErrors && m.ejectedUntil.IsZero() && c.eject(m) {
+			why = fmt.Sprintf("%d consecutive connection failures", m.errors)
+		}
 	}
-	m.errors++
-	if m.errors >= c.cfg.lb.ejectErrors && m.ejectedUntil.IsZero() {
-		c.eject(m)
+	c.mu.Unlock()
+	if why != "" {
+		warnf("ejecting %s (%s)", m.endpoint, why)
 	}
 }
 
 // -- ejection and re-admission --
 
 // eject takes m out of rotation (caller holds c.mu) — unless it is the last
-// usable member: a slow or flaky member beats none.
-func (c *Connector) eject(m *member) {
+// usable member: a slow or flaky member beats none. It reports whether it
+// did, for the caller to log once c.mu is released.
+func (c *Connector) eject(m *member) bool {
 	last := true
 	for _, o := range c.members {
 		if o != m && o.usable() {
@@ -610,7 +647,7 @@ func (c *Connector) eject(m *member) {
 		}
 	}
 	if last {
-		return
+		return false
 	}
 	now := time.Now()
 	if now.Sub(m.readmittedAt) > c.cfg.lb.ejectBackoffMax {
@@ -619,7 +656,18 @@ func (c *Connector) eject(m *member) {
 	m.ejections++
 	m.ejectedUntil = now.Add(c.backoffFor(m))
 	c.ensureMaintainer()
+	return true
 }
+
+// warnf logs a pool event as a warning through the default log/slog
+// logger, worded as the other skaidb drivers log theirs. Never called under
+// c.mu: a handler may itself run statements through this pool.
+func warnf(format string, args ...any) {
+	slog.Warn("skaidb pool: " + fmt.Sprintf(format, args...))
+}
+
+// millis is d in milliseconds, as the pool's warnings give it.
+func millis(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
 // backoffFor is the length of m's current ejection: the base, doubled per
 // repeat, capped.
@@ -697,16 +745,20 @@ func (c *Connector) probe(m *member) {
 		cn.Close()
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	m.probing = false
-	if ok && !c.closed {
+	readmit := ok && !c.closed
+	if readmit {
 		m.ejectedUntil = time.Time{}
 		m.freshStart()
 		m.readmittedAt = time.Now()
-		return
+	} else {
+		m.ejections++
+		m.ejectedUntil = time.Now().Add(c.backoffFor(m))
 	}
-	m.ejections++
-	m.ejectedUntil = time.Now().Add(c.backoffFor(m))
+	c.mu.Unlock()
+	if readmit {
+		warnf("re-admitted %s", m.endpoint)
+	}
 }
 
 // -- discovery --

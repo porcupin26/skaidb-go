@@ -13,8 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -286,6 +288,52 @@ func memberAt(t *testing.T, c *Connector, endpoint string, f func(m *member)) {
 	f(m)
 }
 
+// roundTrips feeds the Connector's latency measurements round trips of a
+// chosen length on the named member, as a connection to it would.
+func roundTrips(t *testing.T, c *Connector, ms []*fakeMember) func(name string, d time.Duration) {
+	t.Helper()
+	byName := map[string]*member{}
+	for _, f := range ms {
+		memberAt(t, c, f.endpoint, func(m *member) { byName[f.name] = m })
+	}
+	return func(name string, d time.Duration) { c.observe(byName[name], d) }
+}
+
+// poolLog keeps each line logged while a test runs: the default slog
+// logger the pool warns through writes to the log package's output.
+type poolLog struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func capturePoolLog(t *testing.T) *poolLog {
+	l := &poolLog{}
+	prev := log.Writer()
+	log.SetOutput(l)
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return l
+}
+
+func (l *poolLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, strings.TrimSuffix(string(p), "\n"))
+	return len(p), nil
+}
+
+// matching is the lines logged so far that contain substr.
+func (l *poolLog) matching(substr string) []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []string
+	for _, line := range l.lines {
+		if strings.Contains(line, substr) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -437,15 +485,23 @@ func TestAFailingMemberIsEjectedThenReadmittedByTheProbe(t *testing.T) {
 	b.refuse.Store(true)
 	c, db := lbDB(t, endpointsOf(ms), "load_balancing=round_robin&eject_errors=2&eject_backoff=300ms")
 	db.SetMaxIdleConns(0)
+	logged := capturePoolLog(t)
 	if served := whoN(t, db, 12); count(served, "b") != 0 {
 		t.Fatalf("served %v from a refusing member", served)
 	}
 	if s := stateOf(c, b.endpoint); s != "ejected" {
 		t.Fatalf("b is %q, want ejected", s)
 	}
+	if got := logged.matching("skaidb pool: ejecting"); len(got) != 1 ||
+		!strings.HasSuffix(got[0], "WARN skaidb pool: ejecting "+b.endpoint+" (2 consecutive connection failures)") {
+		t.Errorf("logged %q, want b ejected for 2 consecutive connection failures", got)
+	}
 	// Healthy again: the background probe re-admits it after the backoff.
 	b.refuse.Store(false)
 	waitFor(t, "the probe to re-admit b", func() bool { return stateOf(c, b.endpoint) == "ready" })
+	waitFor(t, "the re-admission to be logged", func() bool {
+		return len(logged.matching("WARN skaidb pool: re-admitted "+b.endpoint)) == 1
+	})
 	if served := whoN(t, db, 6); count(served, "b") == 0 {
 		t.Errorf("served %v: a re-admitted member gets connections", served)
 	}
@@ -526,6 +582,99 @@ func TestOneSlowStatementDoesNotEjectAMember(t *testing.T) {
 	whoN(t, db, 6)
 	if s := stateOf(c, b.endpoint); s != "ready" {
 		t.Errorf("b is %q after one slow statement, want ready", s)
+	}
+}
+
+// The first statements on b stall in the client — a CPU-bound application
+// starting up, the goroutine waiting for the answer not scheduled — and b
+// answers fast from then on: the fastest of its first round trips seeds its
+// average, so b stays in rotation.
+// (Seeded by its first round trip alone, b's average still read 3.8 s when
+// it was first compared with the others, and b was ejected.)
+func TestASlowFirstRoundTripDoesNotEjectAMember(t *testing.T) {
+	ms := fakeMembers(t, "a", "b", "c")
+	b := ms[1]
+	c, _ := lbDB(t, endpointsOf(ms), "load_balancing=round_robin&eject_latency_floor=50ms")
+	rt := roundTrips(t, c, ms)
+	rt("b", 6600*time.Millisecond)
+	rt("b", 3*time.Second)
+	for i := 0; i < 12; i++ {
+		for _, name := range []string{"a", "b", "c"} {
+			rt(name, 200*time.Microsecond)
+		}
+	}
+	if s := stateOf(c, b.endpoint); s != "ready" {
+		t.Errorf("b is %q after a slow first round trip, want ready", s)
+	}
+	memberAt(t, c, b.endpoint, func(m *member) {
+		if m.ewma >= 50*time.Millisecond {
+			t.Errorf("b's average is %v, want it seeded by its fastest first round trip", m.ewma)
+		}
+	})
+}
+
+// b is slow from its first round trip: seeded slow, it is ejected once it
+// and the others have ten round trips, and the warning names its average,
+// the median and the slowest of its last ten — the one 900 ms statement.
+func TestAMemberSlowFromItsFirstRoundTripIsEjectedAndTheWarningNamesItsSlowest(t *testing.T) {
+	ms := fakeMembers(t, "a", "b", "c")
+	b := ms[1]
+	c, _ := lbDB(t, endpointsOf(ms), "load_balancing=round_robin&eject_latency_floor=50ms&eject_backoff=30s")
+	rt := roundTrips(t, c, ms)
+	logged := capturePoolLog(t)
+	for i := 0; i < 12; i++ {
+		rt("a", 200*time.Microsecond)
+		rt("c", 200*time.Microsecond)
+		if i == 5 {
+			rt("b", 900*time.Millisecond)
+		} else {
+			rt("b", 500*time.Millisecond)
+		}
+	}
+	if s := stateOf(c, b.endpoint); s != "ejected" {
+		t.Fatalf("b is %q, want ejected", s)
+	}
+	ejected := logged.matching("skaidb pool: ejecting")
+	if len(ejected) != 1 {
+		t.Fatalf("logged %q, want one ejection", ejected)
+	}
+	want := regexp.MustCompile(`WARN skaidb pool: ejecting ` + regexp.QuoteMeta(b.endpoint) +
+		` \(latency 5\d\d\.\d ms vs median 0\.2 ms; slowest of the last 10 round trips 900\.0 ms\)$`)
+	if !want.MatchString(ejected[0]) {
+		t.Errorf("logged %q, want it to match %s", ejected[0], want)
+	}
+}
+
+// A member the probe re-admits is measured afresh: the round trips it made
+// before are forgotten, and three new ones seed its average.
+func TestAReadmittedMemberIsSeededAfresh(t *testing.T) {
+	ms := fakeMembers(t, "a", "b", "c")
+	b := ms[1]
+	c, _ := lbDB(t, endpointsOf(ms), "load_balancing=round_robin&eject_backoff=100ms")
+	rt := roundTrips(t, c, ms)
+	logged := capturePoolLog(t)
+	rt("b", 40*time.Millisecond)
+	rt("b", 30*time.Millisecond)
+	memberAt(t, c, b.endpoint, func(m *member) { c.eject(m) })
+	waitFor(t, "the probe to re-admit b", func() bool {
+		return len(logged.matching("WARN skaidb pool: re-admitted "+b.endpoint)) == 1
+	})
+	memberAt(t, c, b.endpoint, func(m *member) {
+		if m.ewma != 0 || m.seeded || len(m.firsts) != 0 || len(m.recent) != 0 || m.samples != 0 {
+			t.Errorf("re-admitted with average %v (seeded %v), %d first and %d recent round trips over %d samples, want none",
+				m.ewma, m.seeded, len(m.firsts), len(m.recent), m.samples)
+		}
+	})
+	for i, d := range []time.Duration{4 * time.Millisecond, 3 * time.Millisecond, 2 * time.Millisecond} {
+		rt("b", d)
+		memberAt(t, c, b.endpoint, func(m *member) {
+			switch {
+			case i < 2 && m.seeded:
+				t.Errorf("seeded at %v after %d round trips, want not measured until its first three", m.ewma, i+1)
+			case i == 2 && (!m.seeded || m.ewma != 2*time.Millisecond):
+				t.Errorf("average %v (seeded %v), want the fastest of the first three round trips, 2ms", m.ewma, m.seeded)
+			}
+		})
 	}
 }
 
@@ -737,14 +886,17 @@ func TestMembersAreDiscoveredAndResyncingOnesGetNoConnections(t *testing.T) {
 		t.Fatalf("c is %q, want resyncing", s)
 	}
 	// c catches up: the next refresh lets it in, measured afresh.
-	memberAt(t, c, cm.endpoint, func(m *member) { m.ewma, m.samples = 9900*time.Millisecond, 50 })
+	memberAt(t, c, cm.endpoint, func(m *member) {
+		m.ewma, m.seeded, m.samples = 9900*time.Millisecond, true, 50
+		m.recent = append(m.recent, 9900*time.Millisecond)
+	})
 	mu.Lock()
 	states[cm.endpoint] = "ready"
 	mu.Unlock()
 	listNow(t, c)
 	memberAt(t, c, cm.endpoint, func(m *member) {
-		if m.ewma != 0 || m.samples != 0 {
-			t.Errorf("c back to ready kept ewma %v over %d samples", m.ewma, m.samples)
+		if m.ewma != 0 || m.seeded || m.samples != 0 || len(m.recent) != 0 {
+			t.Errorf("c back to ready kept ewma %v (seeded %v) over %d samples, %d recent", m.ewma, m.seeded, m.samples, len(m.recent))
 		}
 	})
 	if served := whoN(t, db, 6); count(served, "c") == 0 {

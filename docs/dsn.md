@@ -60,7 +60,7 @@ the DSN.
 | `discover` | `false` | `true`/`1`: read the members with `SHOW ENDPOINTS` (server ≥ 0.327) on the first connection to each member not yet named and every `refresh_interval` after. Joiners are added, leavers dropped (seeds are kept, as `unlisted`), only `ready` members get new connections. No rows (standalone) or an error (older server): the seeds stay and the driver stops asking |
 | `refresh_interval` | `60s` | discovery's period; every 5 s while a member is `resyncing` or `unreachable` |
 | `eject_errors` | `3` | consecutive transport failures (failed dial, I/O error or deadline mid-statement, capacity refusal) that eject a member; statement errors and refused logins do not count |
-| `eject_latency_factor` | `3` | eject a member whose average exceeds this × the other members' median (after 10 round trips on it and on another member); `0` disables |
+| `eject_latency_factor` | `3` | eject a member whose average exceeds this × the other members' median (after 10 round trips on it and on another member); `0` disables. The fastest of a member's first three round trips seeds its average, so a statement that stalls in your own process (a CPU-bound start-up) cannot get a healthy member ejected; the warning, through `log/slog`, names the average, the median and the slowest of the member's last 10 round trips |
 | `eject_latency_floor` | `50ms` | … and is also more than this above the median |
 | `eject_backoff` | `5s` | how long an ejection lasts; doubled per repeat. A background probe re-admits the member afterwards. The last usable member is never ejected |
 | `eject_backoff_max` | `60s` | the cap on the doubling; a member healthy this long after re-admission starts over |

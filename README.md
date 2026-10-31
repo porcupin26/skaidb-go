@@ -77,7 +77,7 @@ The module is a single package with no dependencies. `go mod vendor` works
 as usual; or point a `replace` at a checkout:
 
 ```
-require github.com/porcupin26/skaidb-go v1.3.0
+require github.com/porcupin26/skaidb-go v1.3.1
 replace github.com/porcupin26/skaidb-go => ../skaidb-go
 ```
 
@@ -773,11 +773,17 @@ The same through the DSN alone:
 | `discover` / `Discover` | off | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) on the first connection to each member not yet named, and every `refresh_interval` after (every 5 s while a member is `resyncing` or `unreachable`). New members are added, members that left are dropped (a seed is kept, marked `unlisted`), and only `ready` members get new connections; a member back to `ready` starts with a fresh average. A seed given as a host name is matched to the endpoint the server reports. A standalone server (no rows) or an older one (an error) leaves the seeds as they are, and the connector stops asking. |
 | `refresh_interval` / `RefreshInterval` | 60 s | How often discovery re-reads the members. |
 | `eject_errors` / `EjectErrors` | 3 | Consecutive transport failures that eject a member: a failed dial, an I/O error or a deadline mid-statement, a capacity refusal. Statement errors, refused logins, a cancelled context and this side's problems (an unreadable TLS file, a session database the server refuses) do not count. |
-| `eject_latency_factor`, `eject_latency_floor` / `EjectLatencyFactor`, `EjectLatencyFloor` | 3, 50 ms | With at least 10 round trips on it and on another usable member, a member whose average is above factor × the other usable members' median **and** more than floor above it is ejected. Factor 0 disables. |
+| `eject_latency_factor`, `eject_latency_floor` / `EjectLatencyFactor`, `EjectLatencyFloor` | 3, 50 ms | With at least 10 round trips on it and on another usable member, a member whose average is above factor × the other usable members' median **and** more than floor above it is ejected. The fastest of a member's first three round trips seeds its average, so a statement that stalls in your own process — a CPU-bound start-up — cannot get a healthy member ejected; the warning names the average, the median and the slowest of the member's last 10 round trips. Factor 0 disables. |
 | `eject_backoff`, `eject_backoff_max` / `EjectBackoff`, `EjectBackoffMax` | 5 s, 60 s | How long an ejection lasts, doubled per repeat up to the max; a member healthy for the max after a re-admission starts over. When it is up, a background goroutine dials the member alone and runs one statement: success re-admits it with a fresh average, failure ejects it again. **The last usable member is never ejected.** |
 
-The round-trip average is per member: each statement's time from sending
-the request to the first response frame moves it 5 % of the way, and no
+The round-trip average is per member, over each statement's time from
+sending the request to the first response frame. The fastest of a member's
+first three round trips seeds it — a round trip is only ever lengthened, by
+the member, the network or your own process stalling, so one or two slow
+first statements cannot set it (a stall that covers all three still seeds
+it high, and it decays from there) — and until then the member counts as
+not measured (`least_latency` tries it, `Members` reports `Latency` 0).
+From then on each round trip moves it 5 % of the way, and no
 sample counts for more than 10 × the larger of the average and the floor —
 one slow statement barely moves it, a member that stays slow is ejected
 within a few dozen statements.
@@ -828,11 +834,26 @@ for _, m := range c.Members() {
 }
 ```
 
-`State` is `ready`, `ejected`, `resyncing`, `unreachable` or `unlisted`.
+`State` is `ready`, `ejected`, `resyncing`, `unreachable` or `unlisted`;
+`Latency` is 0 until the member's third round trip.
 `Open` counts the member's connections, idle or in use (`db.Stats()` has the
 pool-wide split). Keep the `*Connector` from `NewConnector` to call it;
 `database/sql` does not hand back the connector of a `*sql.DB` opened with
 `sql.Open`.
+
+Ejections and re-admissions are logged as warnings through the default
+`log/slog` logger, worded as the other skaidb drivers log them:
+
+```
+WARN skaidb pool: ejecting db2:7000 (latency 516.3 ms vs median 0.2 ms; slowest of the last 10 round trips 900.0 ms)
+WARN skaidb pool: ejecting db3:7000 (3 consecutive connection failures)
+WARN skaidb pool: re-admitted db2:7000
+```
+
+A latency ejection names the member's average, the median it was compared
+with and the slowest of its last 10 round trips, which tells a slow member
+from one slow statement. `slog.SetDefault` routes them (with the default
+handler they go to the `log` package's output).
 
 ## Multiple result sets
 

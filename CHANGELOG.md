@@ -4,6 +4,32 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.3.1] — 2026-10-31
+
+### Fixed
+- One slow round trip at the start can no longer get a healthy member
+  ejected for latency. A member's first round trip set its average
+  outright, so a statement that stalled in the client — a CPU-bound
+  application starting up, the goroutine waiting for the answer not
+  scheduled — put seconds into it; ten round trips later the member was
+  compared with the others, and the average had barely decayed: ejected
+  while it answered in milliseconds. The fastest of a member's first three
+  round trips now seeds its average (a round trip is only ever
+  lengthened), and later ones move it as before. Until it is seeded the
+  member counts as not measured: `least_latency` tries it, and `Members()`
+  reports its `Latency` as 0.
+
+### Added
+- The connector logs each ejection and re-admission as a warning through
+  the default `log/slog` logger, worded as the other skaidb drivers log them
+  (`skaidb pool: ejecting db3:7000 (3 consecutive connection failures)`,
+  `skaidb pool: re-admitted db3:7000`); ejections were silent. A latency
+  ejection names the member's average, the median it was compared with and
+  the slowest of its last 10 round trips (`latency 516.3 ms vs median
+  0.2 ms; slowest of the last 10 round trips 900.0 ms`), which tells a slow
+  member from one slow statement. The log is written after the connector
+  releases its lock, so a handler may itself use the pool.
+
 ## [1.3.0] — 2026-10-29
 
 ### Added
