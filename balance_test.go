@@ -31,7 +31,8 @@ import (
 // (after delay), SHOW ENDPOINTS answers listing, SHOW DATABASES (the
 // probe) answers no rows, anything else is a one-row mutation. refuse
 // closes each new connection before the handshake; deny refuses the login;
-// oldServer answers SHOW ENDPOINTS with a parse error.
+// oldServer answers SHOW ENDPOINTS with a parse error; conflict refuses
+// every COMMIT with a transaction conflict.
 type fakeMember struct {
 	name      string
 	endpoint  string
@@ -42,6 +43,7 @@ type fakeMember struct {
 	refuse    atomic.Bool
 	deny      atomic.Bool
 	oldServer atomic.Bool
+	conflict  atomic.Bool
 	listings  atomic.Int64 // SHOW ENDPOINTS asked
 
 	mu      sync.Mutex
@@ -147,6 +149,8 @@ func (m *fakeMember) serve(s net.Conn) {
 			}
 		case text == "SHOW DATABASES":
 			resp = fakeRowsFrame([]string{"name"}, nil)
+		case text == "COMMIT" && m.conflict.Load():
+			resp = appendStr([]byte{3}, conflictMsg)
 		case strings.HasPrefix(text, "SELECT"):
 			time.Sleep(time.Duration(m.delay.Load()))
 			resp = fakeRowsFrame([]string{"member"}, [][]any{{m.name}})

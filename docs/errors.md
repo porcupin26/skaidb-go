@@ -1,10 +1,11 @@
 # Errors
 
 Driver errors are plain `error` values whose message starts with
-`skaidb:`; there is no exported error type. Match on the standard sentinels
-where they apply (`context.DeadlineExceeded`, `context.Canceled`,
-`sql.ErrNoRows`) and on message text otherwise — the messages below are
-stable within the 1.x line.
+`skaidb:`; there is no exported error type. Match on the sentinels where
+they apply: the standard ones (`context.DeadlineExceeded`,
+`context.Canceled`, `sql.ErrNoRows`) and this package's
+`skaidb.ErrTransactionConflict`. Match on message text otherwise — the
+messages below are stable within the 1.x line.
 
 ## From `sql.Open` (DSN validation)
 
@@ -58,7 +59,9 @@ stable within the 1.x line.
 | `skaidb: batch row N is B bytes, over the L-byte frame limit` | one `ExecBatch` row larger than a wire frame |
 | `skaidb: <server message> (row numbers count from batch row N; the N rows before it applied)` | a chunked `ExecBatch` failed in a later chunk |
 | `skaidb: bad consistency "…"` | `WithConsistency` with an unknown level; the statement did not run |
-| `skaidb: transactions are not supported` | `Begin`/`BeginTx` |
+| `skaidb: transaction conflict: …` | the server refused a `COMMIT` because another writer changed a row the transaction writes after it began. Matches `skaidb.ErrTransactionConflict` with `errors.Is`; only the `transaction conflict:` start of the server's text is fixed. Nothing was committed, the transaction is over and the connection stays usable: run the transaction again from its opening statement (`skaidb.Transaction` does) |
+| `skaidb: transaction attempts must be at least 1, got N` | `Transaction`/`TransactionConn` with `TxAttempts` below 1; nothing was sent |
+| `skaidb: transactions are not supported` | `Begin`/`BeginTx`: `*sql.Tx` is not wired — use `skaidb.Transaction` |
 | `skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow` | `Result.LastInsertId` |
 | `skaidb: connection is busy streaming a result set — close those rows before running another statement` | a second statement on a `*sql.Conn` whose streamed rows are still open |
 | `skaidb: connection closed` | a statement on a `*sql.Conn` after `Close` |
@@ -78,6 +81,11 @@ walks the members, which is where failover to another node happens. A
 transport failure (or an expired deadline, not a cancellation) also counts
 against the member; enough in a row eject it for a while (see
 [dsn.md](dsn.md#load-balancing)).
+
+A statement error — a transaction conflict included — is none of these: the
+connection stays in the pool and nothing counts against the member.
+`skaidb.Transaction` runs a transaction again only after a conflict at
+`COMMIT`; it never retries a transport failure.
 
 ## Errors during a stream
 

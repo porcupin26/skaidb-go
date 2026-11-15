@@ -31,17 +31,18 @@ db, err := sql.Open("skaidb", "skaidb://skaidb:secret@localhost:7000/app?consist
 4. [Public API](#public-api) — every exported symbol
 5. [Parameter binding and type mapping](#parameter-binding-and-type-mapping)
 6. [Prepared statements](#prepared-statements)
-7. [Batches and transactions](#batches-and-transactions) — `ExecBatch`: many rows, one round trip
-8. [Streaming large results](#streaming-large-results) — and the abandon/drain rule
-9. [Streams: `Subscribe`](#streams-subscribe)
-10. [Context: deadlines and cancellation](#context-deadlines-and-cancellation)
-11. [Connection pooling](#connection-pooling) — balancing across members, health ejection, discovery
-12. [Multiple result sets](#multiple-result-sets)
-13. [Errors](#errors)
-14. [Versioning and compatibility](#versioning-and-compatibility)
-15. [Conformance](#conformance)
-16. [Development](#development)
-17. [Releasing](#releasing)
+7. [Batches](#batches) — `ExecBatch`: many rows, one round trip
+8. [Transactions](#transactions) — `Transaction`: one connection, a retry on a conflict
+9. [Streaming large results](#streaming-large-results) — and the abandon/drain rule
+10. [Streams: `Subscribe`](#streams-subscribe)
+11. [Context: deadlines and cancellation](#context-deadlines-and-cancellation)
+12. [Connection pooling](#connection-pooling) — balancing across members, health ejection, discovery
+13. [Multiple result sets](#multiple-result-sets)
+14. [Errors](#errors)
+15. [Versioning and compatibility](#versioning-and-compatibility)
+16. [Conformance](#conformance)
+17. [Development](#development)
+18. [Releasing](#releasing)
 
 Further reading: [server documentation](https://skaidb.org/docs/) ·
 [wire protocol](https://skaidb.org/docs/PROTOCOL.html) ·
@@ -77,7 +78,7 @@ The module is a single package with no dependencies. `go mod vendor` works
 as usual; or point a `replace` at a checkout:
 
 ```
-require github.com/porcupin26/skaidb-go v1.3.1
+require github.com/porcupin26/skaidb-go v1.4.0
 replace github.com/porcupin26/skaidb-go => ../skaidb-go
 ```
 
@@ -237,9 +238,10 @@ More: [docs/dsn.md](docs/dsn.md).
 The package registers itself as `"skaidb"` with `database/sql` in `init`.
 Beyond the stdlib surface it exports `Version`, `WithStreaming`,
 `WithConsistency`, `Subscribe`/`Event`, the batch API (`ExecBatch`,
-`ExecBatchConn`, `BatchExecer`) and the balancing connector
-(`NewConnector`, `Connector`, `Option` and its constructors, `Policy`,
-`MemberInfo`).
+`ExecBatchConn`, `BatchExecer`), the transaction helper (`Transaction`,
+`TransactionConn`, `TxOption` and its constructors,
+`ErrTransactionConflict`) and the balancing connector (`NewConnector`,
+`Connector`, `Option` and its constructors, `Policy`, `MemberInfo`).
 
 ### `Version`
 
@@ -337,9 +339,40 @@ type BatchExecer interface {
 ```
 
 Run one statement over many parameter rows in **one round trip** and get the
-total affected-row count; see [batches](#batches-and-transactions).
+total affected-row count; see [batches](#batches).
 `BatchExecer` is implemented by the driver's `driver.Conn`, reachable through
 `(*sql.Conn).Raw`; the two functions wrap that.
+
+### `Transaction`, `TransactionConn` and `TxOption`
+
+```go
+func Transaction(ctx context.Context, db *sql.DB, body func(conn *sql.Conn) error, opts ...TxOption) error
+func TransactionConn(ctx context.Context, c *sql.Conn, body func(conn *sql.Conn) error, opts ...TxOption) error
+
+type TxOption func(*txConfig) // opaque: built by the functions below
+func TxAttempts(n int) TxOption          // runs in all when COMMIT conflicts; default 3
+func TxBegin(statement string) TxOption  // the opening statement; default "BEGIN"
+```
+
+Run `body` between the opening statement and `COMMIT` on **one connection**
+— a pooled one taken for the duration (`Transaction`), or one you hold
+(`TransactionConn`) — and run it again when the `COMMIT` is refused with a
+conflict. `body` gets the connection: every statement of the transaction
+goes through that `*sql.Conn`. A `body` error sends `ROLLBACK` and is
+returned as it is; `TxAttempts` below 1 is an error before anything is
+sent. See [transactions](#transactions).
+
+### `ErrTransactionConflict`
+
+```go
+var ErrTransactionConflict = errors.New("skaidb: transaction conflict")
+```
+
+Matches, with `errors.Is`, the error of a statement the server refused with
+a transaction conflict — a `COMMIT` whose transaction writes a row another
+writer changed after it began. The error's own text is the server's message
+behind `skaidb: `, like every statement error. See
+[transactions](#transactions).
 
 ### `NewConnector`, `Connector` and `Option`
 
@@ -395,7 +428,7 @@ For the curious, and for anyone using `driver` types directly:
 |---|---|
 | `driver.Driver`, `driver.DriverContext` | `OpenConnector(dsn)` parses the DSN at `sql.Open` (a malformed DSN fails there, nothing is dialled); `Open(dsn)` parses and dials, for code that holds the driver value directly |
 | `driver.Connector`, `io.Closer` | `*Connector`: one dial per pooled connection, to the member the balancing policy picks; `db.Driver()` returns the registered driver; `db.Close()` closes it |
-| `driver.Conn` | `Prepare`, `Close`; `Begin` returns an error (no transactions). Also implements this package's `BatchExecer` (via `(*sql.Conn).Raw`) |
+| `driver.Conn` | `Prepare`, `Close`; `Begin` returns an error — `*sql.Tx` is not wired, [transactions](#transactions) go through `Transaction`. Also implements this package's `BatchExecer` (via `(*sql.Conn).Raw`) |
 | `driver.Validator` | retires connections broken mid-statement, and connections to a member that left the rotation, before the pool reuses them |
 | `driver.SessionResetter` | turns down an idle connection whose member left the rotation while it sat in the pool, so `database/sql` closes it and uses another |
 | `driver.NamedValueChecker` | accepts any Go value so slices and maps can reach the typed path |
@@ -499,11 +532,7 @@ The parameter count is checked against the server's view of the statement:
 
 More: [docs/prepared-statements.md](docs/prepared-statements.md).
 
-## Batches and transactions
-
-skaidb is non-transactional: every statement auto-commits, and `db.Begin()`
-/ `db.BeginTx()` return `skaidb: transactions are not supported`. Do not
-write code that expects rollback.
+## Batches
 
 A **batch** runs one statement over many parameter rows. `database/sql`
 has no batch call — `ExecContext` per row costs one network round trip each
@@ -575,12 +604,113 @@ var id int64
 err := db.QueryRowContext(ctx, "INSERT INTO t (name) VALUES (?) RETURNING id", name).Scan(&id)
 ```
 
-Atomicity is per statement: an upsert with `INSERT … ON CONFLICT DO
-NOTHING | DO UPDATE SET …` and a single-row `UPDATE` are atomic on the row
-(see the [SQL syntax reference](https://skaidb.org/docs/query_syntax.html));
-there is no client-side transaction spanning statements.
+Outside a transaction, atomicity is per statement: an upsert with
+`INSERT … ON CONFLICT DO NOTHING | DO UPDATE SET …` and a single-row
+`UPDATE` are atomic on the row (see the
+[SQL syntax reference](https://skaidb.org/docs/query_syntax.html)).
+Statements that must apply together go in a [transaction](#transactions).
 
 More: [docs/batch.md](docs/batch.md).
+
+## Transactions
+
+A transaction is SQL sent on **one connection**: an opening statement, the
+statements, then `COMMIT` or `ROLLBACK`. A standalone server opens one with
+`BEGIN`; a cluster with `BEGIN ATOMIC` or
+`BEGIN ATOMIC PARTITION (col = literal)`. `skaidb.Transaction` sends the
+opening statement and the `COMMIT` around your function, on a connection it
+takes out of the pool for the whole transaction:
+
+```go
+var left int64
+err := skaidb.Transaction(ctx, db, func(conn *sql.Conn) error {
+    if err := conn.QueryRowContext(ctx, "SELECT qty FROM stock WHERE id = ?", id).Scan(&left); err != nil {
+        return err
+    }
+    if left == 0 {
+        return errSoldOut // ROLLBACK is sent; Transaction returns errSoldOut
+    }
+    left--
+    _, err := conn.ExecContext(ctx, "UPDATE stock SET qty = ? WHERE id = ?", left, id)
+    return err
+})
+```
+
+A standalone server (≥ 0.346.0) refuses a `COMMIT` when another writer
+changed a row the transaction writes after it began. Nothing was committed,
+the transaction is over, and the connection is back in autocommit and
+usable — so `Transaction` runs the function again from the opening
+statement, at once and on the same connection, up to three runs in all.
+
+- **One connection.** Run every statement of the transaction on the
+  `*sql.Conn` the function is given. A statement sent through the `*sql.DB`
+  goes to whichever pooled connection is free, outside the transaction.
+  `skaidb.TransactionConn(ctx, conn, fn)` is the same on a `*sql.Conn` you
+  already hold; it leaves the connection open.
+- **The function may run more than once.** It must be safe to repeat: read
+  what it needs inside the transaction, and do nothing outside the database
+  that a second run would do twice. A value it computes is yours to
+  capture, as `left` above; after a retry it holds what the last run set.
+  Close every `*sql.Rows` before returning.
+- **If the opening statement fails**, its error is returned, the function
+  does not run and nothing else is sent.
+- **If the function returns an error**, `ROLLBACK` is sent and that error
+  is returned as it is, whatever the server answers to the `ROLLBACK`. The
+  transaction is not run again, even when the error is a conflict. A
+  function that panics gets its `ROLLBACK` too.
+- **If `COMMIT` fails** with a conflict on the last run, the conflict is
+  returned. Any other `COMMIT` error is returned as it is, with no retry
+  and no `ROLLBACK`: a failed `COMMIT` has ended the transaction.
+- A transport failure or an expired context is the usual error for it and
+  is never retried.
+
+```go
+err := skaidb.Transaction(ctx, db, fn,
+    skaidb.TxBegin("BEGIN ATOMIC PARTITION (tenant = 'acme')"), // sent as it is
+    skaidb.TxAttempts(5))                                       // below 1 is an error, nothing is sent
+```
+
+**The conflict error.** Wherever a statement returns it — `COMMIT` sent by
+hand included — the error matches `skaidb.ErrTransactionConflict` with
+`errors.Is`. Its text is the server's message behind `skaidb: `, like every
+statement error (`skaidb: transaction conflict: a row of table stock was
+changed by another writer after the transaction began — …`); only the
+`transaction conflict:` start of it is fixed, so match with `errors.Is`. It
+is a statement error, not a connection failure: the connection stays in
+the pool and nothing counts against its member.
+
+**By hand.** The same statements work without the helper, on a `*sql.Conn`.
+Two rules: keep the whole transaction on that one connection, and stop if
+the opening statement fails — the statements after it would each commit on
+their own.
+
+```go
+conn, err := db.Conn(ctx) // one connection for the whole transaction
+if err != nil { return err }
+defer conn.Close()
+
+if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+    return err // no transaction: send nothing else
+}
+if _, err := conn.ExecContext(ctx, "UPDATE accounts SET balance = balance - ? WHERE id = ?", 10, from); err != nil {
+    _, _ = conn.ExecContext(ctx, "ROLLBACK") // the statement's error is the one to report
+    return err
+}
+if _, err := conn.ExecContext(ctx, "UPDATE accounts SET balance = balance + ? WHERE id = ?", 10, to); err != nil {
+    _, _ = conn.ExecContext(ctx, "ROLLBACK")
+    return err
+}
+if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+    // errors.Is(err, skaidb.ErrTransactionConflict): nothing was committed, run it again from BEGIN.
+    // Whatever the error, the transaction is over: no ROLLBACK.
+    return err
+}
+```
+
+A statement that fails inside a transaction does not end it: the
+transaction stays open until `COMMIT` or `ROLLBACK`. `database/sql`'s own
+`db.Begin()` / `db.BeginTx()` are not wired to any of this and return
+`skaidb: transactions are not supported`.
 
 ## Streaming large results
 
@@ -728,7 +858,9 @@ apply (`SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime`,
 - the session database (`USE` from the DSN path, run on every dial);
 - the prepared-statement cache (by text, up to 240 entries);
 - the default consistency (from the DSN; `WithConsistency` is per
-  statement).
+  statement);
+- an open [transaction](#transactions), which is why `Transaction` keeps
+  one connection for all of it.
 
 Each pooled connection is a single socket that serialises one request /
 one response; concurrency comes from the pool, not from pipelining. A
@@ -878,10 +1010,11 @@ returns `RowsAffected() == 0`.
 
 ## Errors
 
-All driver errors are `*fmt` errors whose text starts with `skaidb:`; there
-is no error type hierarchy to switch on. The messages are stable enough to
-match on, and the context errors and `driver.ErrBadConn` are the standard
-sentinels.
+All driver errors are plain `error` values whose text starts with
+`skaidb:`; there is no error type hierarchy to switch on. The messages are
+stable enough to match on. The sentinels are the standard ones — the
+context errors, `driver.ErrBadConn` — and this package's
+`ErrTransactionConflict`.
 
 | Situation | Error |
 |---|---|
@@ -896,7 +1029,9 @@ sentinels.
 | batches | `skaidb: batch row N: statement expects K parameters, got M`, `skaidb: batch row N is B bytes, over the L-byte frame limit`, `skaidb: <server message> (row numbers count from batch row N; the N rows before it applied)` |
 | parameter problems | `skaidb: statement expects N parameters, got M`, `skaidb: more placeholders than parameters`, `skaidb: more parameters than placeholders`, `skaidb: cannot bind value of type T`, `skaidb: cannot bind NaN/Infinity`, `skaidb: document keys must be strings`, `skaidb: N parameters, over the protocol's 65535` |
 | bad consistency in `WithConsistency` | `skaidb: bad consistency "…"` |
-| transactions | `skaidb: transactions are not supported` |
+| a `COMMIT` refused because another writer changed a row the transaction writes | `skaidb: transaction conflict: …` — matches `skaidb.ErrTransactionConflict` (via `errors.Is`); nothing was committed and the connection stays usable |
+| `Transaction` / `TransactionConn` with `TxAttempts` below 1 | `skaidb: transaction attempts must be at least 1, got N` — nothing was sent |
+| `db.Begin` / `db.BeginTx` | `skaidb: transactions are not supported` — `*sql.Tx` is not wired; use [`Transaction`](#transactions) |
 | `LastInsertId` | `skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow` |
 | second statement during a stream on the same `*sql.Conn` | `skaidb: connection is busy streaming a result set — close those rows before running another statement` |
 | connection lost before the request was written | `driver.ErrBadConn` (retried by `database/sql` on another connection; never visible to you unless every retry fails) |
@@ -926,8 +1061,11 @@ More: [docs/errors.md](docs/errors.md).
   statement per row), certificate login needs a server with the
   EXTERNAL mechanism and `auth.x509_enabled`, and member discovery needs
   `SHOW ENDPOINTS` (server ≥ 0.327; older and standalone servers keep the
-  seed list). Multiple result sets and `RETURNING` are server features the
-  driver merely passes through. Developed against skaidb 0.290.
+  seed list). Multiple result sets, `RETURNING` and transactions are server
+  features the driver merely passes through; a `COMMIT` refused with a
+  conflict — what `ErrTransactionConflict` matches and `Transaction` runs
+  again on — comes from a standalone server ≥ 0.346.0. Developed against
+  skaidb 0.290.
 - The version the driver reports in Hello is [`Version()`](#version), always
   equal to the module version in your `go.mod`.
 

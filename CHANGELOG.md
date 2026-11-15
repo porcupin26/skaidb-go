@@ -4,6 +4,30 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.4.0] — 2026-11-15
+
+### Added
+- **A retrying transaction helper**: `skaidb.Transaction(ctx, db,
+  func(conn *sql.Conn) error { … })` runs the function between `BEGIN` and
+  `COMMIT` on one pooled connection it holds for the whole transaction, and
+  `skaidb.TransactionConn` does the same on a `*sql.Conn` of yours. When
+  the server refuses the `COMMIT` with a transaction conflict — a
+  standalone server ≥ 0.346.0 does when another writer changed a row the
+  transaction writes after it began — the function runs again from the
+  opening statement, at once and on the same connection: three runs in all
+  by default (`TxAttempts`). `TxBegin` sets the opening statement
+  (`BEGIN ATOMIC …` on a cluster). A refused opening statement ends it
+  before the function runs; an error from the function sends `ROLLBACK`
+  and comes back as it is, whatever the server answers to the `ROLLBACK`
+  (a panic gets its `ROLLBACK` too); any other `COMMIT` error is returned
+  with no retry and no `ROLLBACK`; `TxAttempts` below 1 is an error before
+  anything is sent.
+- **`ErrTransactionConflict`**: a sentinel `errors.Is` matches for a server
+  error whose message starts with `transaction conflict:`, on every
+  statement path — text, prepared, streamed, batch. The error's text stays
+  `skaidb: <server message>`, and it is a statement error: the connection
+  stays in the pool and nothing counts against its member.
+
 ## [1.3.1] — 2026-10-31
 
 ### Fixed

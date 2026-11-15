@@ -1,9 +1,10 @@
-# Batches, and living without transactions
+# Batches and bulk writes
 
-skaidb has no multi-statement transactions. `db.Begin()` returns
-`skaidb: transactions are not supported`; every statement is atomic on its
-own and commits when the server acknowledges it at the requested
-consistency.
+Outside a [transaction](../README.md#transactions) every statement is
+atomic on its own and commits when the server acknowledges it at the
+requested consistency. This chapter is about writing many rows that way;
+statements that must apply together or not at all go in a transaction
+(`skaidb.Transaction`).
 
 ## Bulk writes: `ExecBatch`
 

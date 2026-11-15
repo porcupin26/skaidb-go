@@ -228,9 +228,9 @@ func (c *conn) sendBatchChunk(req []byte, start int) (int64, bool, error) {
 			return 0, true, nil
 		}
 		if start > 0 {
-			return 0, false, fmt.Errorf("skaidb: %s (row numbers count from batch row %d; the %d rows before it applied)", msg, start, start)
+			return 0, false, fmt.Errorf("%w (row numbers count from batch row %d; the %d rows before it applied)", serverError(msg), start, start)
 		}
-		return 0, false, fmt.Errorf("skaidb: %s", msg)
+		return 0, false, serverError(msg)
 	default:
 		c.broken.Store(true)
 		return 0, false, fmt.Errorf("skaidb: unexpected response tag %d to a batch", tag)

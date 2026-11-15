@@ -690,7 +690,12 @@ func (c *conn) Close() error {
 	return c.nc.Close()
 }
 
-// skaidb is non-transactional; expose that honestly.
+// database/sql's own transaction API (db.Begin / db.BeginTx, *sql.Tx) is not
+// wired to the server's transactions: sql.TxOptions has no place for the
+// opening statement a cluster needs (BEGIN ATOMIC …). Transaction and
+// TransactionConn (transaction.go) are the way in, or BEGIN … COMMIT sent as
+// statements on one *sql.Conn. Callers match on this message, so its text
+// stays as it is.
 func (c *conn) Begin() (driver.Tx, error) {
 	return nil, fmt.Errorf("skaidb: transactions are not supported")
 }
@@ -1376,7 +1381,7 @@ func (c *conn) readRows(r *reader) (driver.Rows, error) {
 	case 2: // Ddl
 		return &rows{cols: []string{}, data: nil}, nil
 	case 3:
-		return nil, fmt.Errorf("skaidb: %s", r.text())
+		return nil, serverError(r.text())
 	default:
 		return nil, fmt.Errorf("skaidb: unknown response tag %d", tag)
 	}
@@ -1399,7 +1404,7 @@ func (c *conn) readResult(r *reader) (driver.Result, error) {
 	case 2:
 		return result{affected: 0}, nil
 	case 3:
-		return nil, fmt.Errorf("skaidb: %s", r.text())
+		return nil, serverError(r.text())
 	default:
 		return nil, fmt.Errorf("skaidb: unknown response tag %d", tag)
 	}
@@ -1542,7 +1547,7 @@ func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Row
 		if len(args) > 0 && msg == unbindableKind {
 			return nil, fmt.Errorf("%w: %s", errUnpreparable, msg)
 		}
-		return nil, fmt.Errorf("skaidb: %s", msg)
+		return nil, serverError(msg)
 	}
 	return nil, fmt.Errorf("skaidb: unexpected response to stream request")
 }
@@ -1622,7 +1627,7 @@ func (r *rows) fill() error {
 			// An Error ends the stream: the rows already delivered stay
 			// valid, and the socket is back at a frame boundary.
 			r.endStream()
-			return fmt.Errorf("skaidb: %s", rd.text())
+			return serverError(rd.text())
 		default:
 			r.endStream()
 			r.c.broken.Store(true)

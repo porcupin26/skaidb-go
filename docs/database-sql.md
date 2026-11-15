@@ -98,9 +98,10 @@ arguments takes. See [prepared-statements.md](prepared-statements.md).
 ## `Conn`
 
 `db.Conn(ctx)` pins one physical connection. Use it when a sequence must
-stay on one socket: a batch on one prepared statement, or a `USE` followed by
-statements that depend on it (prefer the DSN path for the session database —
-it is applied to every pooled connection, `USE` through `Exec` is not).
+stay on one socket: a transaction, a batch on one prepared statement, or a
+`USE` followed by statements that depend on it (prefer the DSN path for the
+session database — it is applied to every pooled connection, `USE` through
+`Exec` is not).
 
 It is also how to **read your own writes** at a weak consistency: the member
 that coordinated a write reads it back at any level, `ONE` included, and a
@@ -121,9 +122,14 @@ streaming" error rather than corrupting the socket.
 
 ## `Begin` / `BeginTx`
 
-Return `skaidb: transactions are not supported`. Every statement
-auto-commits. See [batch.md](batch.md) for the patterns that replace
-transactions.
+Return `skaidb: transactions are not supported`: `*sql.Tx` is not wired to
+skaidb's transactions. A transaction is `BEGIN` … `COMMIT` sent as
+statements on one connection, which `skaidb.Transaction(ctx, db, fn)` does
+on a pooled connection it holds for the duration — running `fn` again when
+the `COMMIT` is refused with a conflict — and `skaidb.TransactionConn` does
+on a `*sql.Conn` you hold. See
+[Transactions](../README.md#transactions) in the README. Outside a
+transaction every statement commits on its own.
 
 ## `Ping`
 
