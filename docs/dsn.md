@@ -117,6 +117,11 @@ statement on every connection of this pool. Override per statement with
 
 DDL runs at quorum on the server regardless of the requested level.
 
+`SET CONSISTENCY <level>` sent as a statement is something else: an
+override on one session, whatever level its requests carry. Like a `USE`
+and like `SET SCAN BUDGET …`, it lasts for the `*sql.Conn` it was sent on;
+see [database-sql.md](database-sql.md#conn).
+
 ## TLS
 
 Any of `tls`, `tls_ca`, `tls_insecure` or `tls_client_cert` switches the connection to TLS;

@@ -104,6 +104,19 @@ session database — it is applied to every pooled connection, while a `USE`
 lasts for the `*sql.Conn` it was sent on and, sent through the `*sql.DB`,
 for that one statement; see [dsn.md](dsn.md#session-database)).
 
+The same goes for the session's settings, `SET CONSISTENCY ONE | QUORUM |
+ALL` and `SET SCAN BUDGET ROWS <n> [BYTES <n>]`: sent on a `*sql.Conn`
+they hold for as long as you keep it — a connection lost meanwhile fails
+its statements, none runs elsewhere without them. When the connection goes
+back to the pool the driver clears what its borrower set
+(`SET SCAN BUDGET DEFAULT`, `SET CONSISTENCY DEFAULT`) before the next
+borrower's first statement, and closes a connection it cannot clear — a
+server before 0.349 refuses `SET CONSISTENCY DEFAULT`. Sent through the
+`*sql.DB`, a setting is over when the statement returns: the next statement
+runs without it, on whichever connection it gets. The driver notes a
+setting the server accepted by the statement's first words, written as the
+server takes them (any case, any whitespace, `--` comments).
+
 It is also how to **read your own writes** at a weak consistency: the member
 that coordinated a write reads it back at any level, `ONE` included, and a
 `*sql.Conn` stays on one member. Run the write and the reads that must see

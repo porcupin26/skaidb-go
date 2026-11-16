@@ -376,6 +376,11 @@ type conn struct {
 	// noteUse). ResetSession takes a connection that differs back to home
 	// before the pool hands it to its next borrower.
 	home, database string
+	// Session settings a statement on this connection left in force, as far
+	// as the driver can tell (see note): a SET CONSISTENCY override, a SET
+	// SCAN BUDGET. A pool's connection has neither, so ResetSession clears
+	// them before the next borrower gets it.
+	consistencyOverride, scanBudget bool
 	// Result sets handed to database/sql and not closed yet. While there is
 	// one, the connection is pinned — a *sql.Conn whose owner is still
 	// reading rows, or has left them open — and database/sql cannot close
@@ -398,14 +403,23 @@ func (c *conn) IsValid() bool {
 // while it sat idle is closed (driver.ErrBadConn) instead of handed out, and
 // the statement runs on another connection.
 //
-// It is also where a connection goes back to the pool's database. A USE is
-// the session's: the borrower that sent one — on a *sql.Conn it held, or
-// through the *sql.DB — left this connection, and no other, in a database
-// the pool was not opened on, and the next borrower's statements would run
-// there. The pool's database is entered again first — the DSN's, or
-// `default` when the DSN names none, which is where every other connection
-// of such a pool is and where the one dialled after a restart will be; a
-// connection that cannot be taken back is closed rather than handed out.
+// It is also where a connection is put back in the pool's own session state.
+// What a statement sets on its session is that one connection's: the
+// borrower that sent it — on a *sql.Conn it held, or through the *sql.DB —
+// left this connection, and no other, changed, and the next borrower's
+// statements would run in a database the pool was not opened on, at a
+// consistency they did not ask for, or under a scan budget that refuses
+// them. So what the borrower changed is undone first, and only that — a
+// borrower that changed nothing costs no round trip:
+//
+//   - the pool's database is entered again: the DSN's, or `default` when the
+//     DSN names none, which is where every other connection of such a pool
+//     is and where the one dialled after a restart will be;
+//   - a scan budget is cleared (SET SCAN BUDGET DEFAULT);
+//   - a consistency override is cleared (SET CONSISTENCY DEFAULT; a server
+//     before 0.349 does not have it).
+//
+// A connection that cannot be put back is closed rather than handed out.
 func (c *conn) ResetSession(ctx context.Context) error {
 	if !c.IsValid() {
 		return driver.ErrBadConn
@@ -416,12 +430,30 @@ func (c *conn) ResetSession(ctx context.Context) error {
 		c.retire()
 		return driver.ErrBadConn
 	}
+	var back []string
 	if c.database != c.home {
-		finish := c.applyContext(ctx)
-		_, err := c.exec(useSQL(c.home))
-		if finish(err) != nil {
+		back = append(back, useSQL(c.home))
+	}
+	if c.scanBudget {
+		back = append(back, "SET SCAN BUDGET DEFAULT")
+	}
+	if c.consistencyOverride {
+		back = append(back, "SET CONSISTENCY DEFAULT")
+	}
+	if len(back) == 0 {
+		return nil
+	}
+	finish := c.applyContext(ctx)
+	for _, statement := range back {
+		// Each is noted like any statement the server accepts (exec), which
+		// is what marks the connection as back where it belongs.
+		if _, err := c.exec(statement); err != nil {
+			_ = finish(err)
 			return driver.ErrBadConn
 		}
+	}
+	if finish(nil) != nil {
+		return driver.ErrBadConn
 	}
 	return nil
 }
@@ -442,12 +474,97 @@ func useSQL(name string) string {
 	return `USE "` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
-// noteUse keeps track of the session database: sqlText was answered with
-// success, and if it is a USE, the session is in the database it names.
-func (c *conn) noteUse(sqlText string) {
-	if name, ok := parseUse(sqlText); ok {
-		c.database = name
+// note keeps track of the session: sqlText was answered with success, and if
+// it is a statement that changes the session — as far as the driver reads
+// them, see sessionStatement — the connection is no longer as the pool
+// hands it out, or is so again.
+func (c *conn) note(sqlText string) {
+	switch kind, database := sessionStatement(sqlText); kind {
+	case useDatabase:
+		c.database = database
+	case consistencySet:
+		c.consistencyOverride = true
+	case consistencyCleared:
+		c.consistencyOverride = false
+	case scanBudgetSet:
+		c.scanBudget = true
+	case scanBudgetCleared:
+		c.scanBudget = false
 	}
+}
+
+// sessionKind is what a statement does to the session it runs in.
+type sessionKind uint8
+
+const (
+	otherStatement     sessionKind = iota // nothing the driver keeps track of
+	useDatabase                           // USE [DATABASE] <name>
+	consistencySet                        // SET CONSISTENCY ONE | QUORUM | ALL
+	consistencyCleared                    // SET CONSISTENCY DEFAULT
+	scanBudgetSet                         // SET SCAN BUDGET ROWS <n> … | BYTES <n> …
+	scanBudgetCleared                     // SET SCAN BUDGET DEFAULT
+)
+
+// sessionStatement reads sqlText as one statement that changes its session:
+// a USE (and the database it names), or a statement whose first words are
+// SET CONSISTENCY or SET SCAN BUDGET — which clears the setting when the
+// next word is DEFAULT and sets one otherwise. The driver reads no further:
+// the server has accepted the statement, so it is one statement and well
+// formed. Words are read as the server's lexer reads them (skipBlank,
+// sqlWord), and the ones that are names to it — everything but SET — may be
+// written in double quotes. Anything else is otherStatement.
+func sessionStatement(sqlText string) (kind sessionKind, database string) {
+	// Every statement the server accepts comes through here; all but a
+	// handful leave at their first word.
+	start := skipBlank(sqlText)
+	first, rest, ok := sqlWord(start)
+	if !ok {
+		return otherStatement, ""
+	}
+	switch {
+	case strings.EqualFold(first, "USE"):
+		if database, ok := parseUse(start); ok {
+			return useDatabase, database
+		}
+	case strings.EqualFold(first, "SET"):
+		word, rest := sqlName(rest)
+		switch {
+		case strings.EqualFold(word, "CONSISTENCY"):
+			switch level, _ := sqlName(rest); {
+			case strings.EqualFold(level, "DEFAULT"):
+				return consistencyCleared, ""
+			case level != "":
+				return consistencySet, ""
+			}
+		case strings.EqualFold(word, "SCAN"):
+			if word, rest = sqlName(rest); !strings.EqualFold(word, "BUDGET") {
+				break
+			}
+			switch limit, _ := sqlName(rest); {
+			case strings.EqualFold(limit, "DEFAULT"):
+				return scanBudgetCleared, ""
+			case limit != "":
+				return scanBudgetSet, ""
+			}
+		}
+	}
+	return otherStatement, ""
+}
+
+// sqlName cuts the next word off s, behind whatever blank precedes it: a
+// bare word, or one in double quotes — the server takes a quoted name
+// wherever a word of a statement is not a keyword of the language. "" when
+// no word comes next.
+func sqlName(s string) (word, rest string) {
+	s = skipBlank(s)
+	if strings.HasPrefix(s, `"`) {
+		if end := strings.IndexByte(s[1:], '"'); end > 0 {
+			return s[1 : 1+end], s[2+end:]
+		}
+		return "", s
+	}
+	word, rest, _ = sqlWord(s)
+	return word, rest
 }
 
 // parseUse reads sqlText as exactly one `USE [DATABASE] <name>` statement:
@@ -1614,7 +1731,7 @@ func (c *conn) query(sqlText string) (driver.Rows, error) {
 	}
 	rs, err := c.readRows(r)
 	if err == nil {
-		c.noteUse(sqlText)
+		c.note(sqlText)
 	}
 	return rs, err
 }
@@ -1719,7 +1836,7 @@ func (c *conn) exec(sqlText string) (driver.Result, error) {
 	}
 	res, err := c.readResult(r)
 	if err == nil {
-		c.noteUse(sqlText)
+		c.note(sqlText)
 	}
 	return res, err
 }
@@ -1865,7 +1982,7 @@ func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Row
 		return c.readRows(&reader{buf: frame})
 	case 1, 2: // Mutation / Ddl through a streaming call
 		if len(args) == 0 {
-			c.noteUse(sqlText)
+			c.note(sqlText)
 		}
 		return &rows{cols: []string{}, done: true}, nil
 	case 3:

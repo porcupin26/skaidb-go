@@ -890,6 +890,13 @@ apply (`SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime`,
   connection that cannot be taken back is closed instead). Sent through
   the `*sql.DB`, a `USE` is over when the statement returns. So a database
   is chosen in the DSN, or on a `*sql.Conn` for as long as it is held;
+- session settings sent as statements, `SET CONSISTENCY …` and
+  `SET SCAN BUDGET …`: like a `USE`, they hold on a `*sql.Conn` for as
+  long as you keep it, and are cleared (`SET SCAN BUDGET DEFAULT`,
+  `SET CONSISTENCY DEFAULT`) before the connection's next borrower gets
+  it; sent through the `*sql.DB` they are over when the statement returns.
+  A connection whose settings cannot be cleared — a server before 0.349
+  has no `SET CONSISTENCY DEFAULT` — is closed instead;
 - the prepared-statement cache (by text, up to 240 entries);
 - the default consistency (from the DSN; `WithConsistency` is per
   statement);

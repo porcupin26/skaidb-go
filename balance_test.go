@@ -40,7 +40,8 @@ import (
 // SCAN BUDGET, an open transaction — and what it was when each statement
 // arrived (ranIn). A SELECT under a scan budget is refused, as a scan is on
 // the server; refuseDefault refuses SET CONSISTENCY DEFAULT, as a server
-// before 0.349 does.
+// before 0.349 does, and a statement that ends in "-- refused" is refused
+// whatever it is.
 type fakeMember struct {
 	name      string
 	endpoint  string
@@ -228,6 +229,8 @@ func (m *fakeMember) serve(conn int, s net.Conn) {
 		switch {
 		case strings.HasPrefix(text, "USE ") && m.refuseUse.Load():
 			resp = appendStr([]byte{3}, "database does not exist")
+		case strings.HasSuffix(text, "-- refused"):
+			resp = appendStr([]byte{3}, "parse error: refused")
 		case text == "SET CONSISTENCY DEFAULT" && m.refuseDefault.Load():
 			resp = appendStr([]byte{3}, "parse error: SET CONSISTENCY takes ONE, QUORUM, or ALL")
 		case strings.HasPrefix(text, "SELECT") && session.scanBudget:
