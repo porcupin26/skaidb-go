@@ -150,7 +150,7 @@ skaidb://[user[:password]@]host[:port][,host2[:port]...][/database][?option=valu
 |---|---|---|
 | `user`, `password` | SCRAM-SHA-256 credentials. Percent-encode reserved characters (`@` → `%40`, `/` → `%2F`, `:` → `%3A`, `?` → `%3F`, `#` → `%23`). Omit both for a server with authentication disabled. With `auth_mechanism=certificate` the user is optional (it must equal the certificate's Common Name) and there is no password. | `anonymous`, empty |
 | `host[:port]`, comma-separated | The **seed list**. Any mix of ports; IPv6 literals in brackets (`[::1]:7000`, `[fe80::1]`). | port `7000` |
-| `/database` | The pool's database: `USE "<database>"` runs on every new pooled connection — one dialled to replace a lost connection included — and again on a connection whose last borrower sent a `USE` of its own. **Name the database here**, not with `USE` through the `*sql.DB`: that reaches one connection and is gone when the connection is replaced. | server default |
+| `/database` | The pool's database: `USE "<database>"` runs on every new pooled connection — one dialled to replace a lost connection included — and again on a connection whose last borrower sent a `USE` of its own. Without it the pool's database is `default`, the one every session starts in, and a connection is taken back to that. **Name the database here**, not with `USE` through the `*sql.DB`: that one is over when the statement returns. | `default` |
 | `consistency` | `one`, `quorum` or `all` — the level for every statement on the connection unless overridden per statement with [`WithConsistency`](#withconsistency). | `quorum` |
 | `tls` | `true`/`1` enables TLS with system-root certificate verification. Implied by `tls_ca`, `tls_insecure` or `tls_client_cert`. | `false` |
 | `tls_ca` | Path to a PEM bundle; the server certificate must chain to it. Enables TLS. | — |
@@ -882,14 +882,14 @@ More: [docs/context.md](docs/context.md).
 apply (`SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime`,
 `SetConnMaxIdleTime`). What is per-connection in this driver:
 
-- the session database: the DSN path's, entered on every dial. A `USE`
-  sent on a `*sql.Conn` holds for as long as you keep that `*sql.Conn`;
-  when its connection goes back to the pool, the DSN's database is entered
-  again before the next borrower's first statement (a connection that
-  cannot be taken back is closed instead). With no database in the DSN
-  there is none to go back to: a `USE` stays on the one connection it was
-  sent on — the other connections never see it, and neither does the
-  connection that replaces that one after a restart;
+- the session database: the pool's is the DSN path's, entered on every
+  dial, or `default` — where every session starts — when the DSN names
+  none. A `USE` sent on a `*sql.Conn` holds for as long as you keep that
+  `*sql.Conn`; when its connection goes back to the pool, the pool's
+  database is entered again before the next borrower's first statement (a
+  connection that cannot be taken back is closed instead). Sent through
+  the `*sql.DB`, a `USE` is over when the statement returns. So a database
+  is chosen in the DSN, or on a `*sql.Conn` for as long as it is held;
 - the prepared-statement cache (by text, up to 240 entries);
 - the default consistency (from the DSN; `WithConsistency` is per
   statement);

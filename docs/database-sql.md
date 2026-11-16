@@ -100,9 +100,9 @@ arguments takes. See [prepared-statements.md](prepared-statements.md).
 `db.Conn(ctx)` pins one physical connection. Use it when a sequence must
 stay on one socket: a transaction, a batch on one prepared statement, or a
 `USE` followed by statements that depend on it (prefer the DSN path for the
-session database — it is applied to every pooled connection, `USE` through
-`Exec` is not; see [dsn.md](dsn.md#session-database) for what becomes of a
-`USE` when its connection goes back to the pool).
+session database — it is applied to every pooled connection, while a `USE`
+lasts for the `*sql.Conn` it was sent on and, sent through the `*sql.DB`,
+for that one statement; see [dsn.md](dsn.md#session-database)).
 
 It is also how to **read your own writes** at a weak consistency: the member
 that coordinated a write reads it back at any level, `ONE` included, and a

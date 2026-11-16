@@ -211,19 +211,89 @@ func TestAConnectionThatCannotGoBackToTheDSNDatabaseIsDropped(t *testing.T) {
 	}
 }
 
-// A DSN that names no database gives the pool none to go back to: a USE
-// stays on the connection it was sent on, and the driver sends none of its
-// own.
-func TestWithoutADSNDatabaseTheDriverSendsNoUse(t *testing.T) {
+// A DSN that names no database opens the pool on the database every session
+// starts in, `default`, and that is where its connections go back to. A
+// borrower's USE lasts for its borrow, as with a database in the DSN: sent
+// through the *sql.DB it is over when the statement returns, on a *sql.Conn
+// when the *sql.Conn is closed. Left on the connection it would hold for
+// whoever got that one connection next and for nobody else — and be gone
+// with the connection, at the next restart.
+func TestWithoutADSNDatabaseABorrowersUseDoesNotOutliveItsBorrow(t *testing.T) {
+	ctx := context.Background()
+	const useDefault = `USE "default"`
+	for name, borrow := range map[string]func(t *testing.T, db *sql.DB) []string{
+		"through the *sql.DB": func(t *testing.T, db *sql.DB) []string {
+			if _, err := db.ExecContext(ctx, "USE other"); err != nil {
+				t.Fatal(err)
+			}
+			return []string{"USE other"}
+		},
+		"on a *sql.Conn": func(t *testing.T, db *sql.DB) []string {
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := conn.ExecContext(ctx, "USE other"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := conn.ExecContext(ctx, addNote); err != nil {
+				t.Fatal(err)
+			}
+			return []string{"USE other", addNote}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := fakeMembers(t, "a")[0]
+			db := memberDB(t, m, "")
+			count1(t, db) // a new session is in default: the driver sends no USE
+			count1(t, db)
+			sent := borrow(t, db)
+			if len(sent) > 1 {
+				// On the *sql.Conn the USE held for as long as it was kept.
+				if got := m.ranIn(t, addNote).database; got != "other" {
+					t.Errorf("the statement behind the USE on its *sql.Conn ran in %q, want other", got)
+				}
+			}
+			count1(t, db)
+			if got := m.ranIn(t, countNotes).database; got != "default" {
+				t.Errorf("the next borrower's statement ran in %q, want default", got)
+			}
+			count1(t, db) // back in default: nothing more to restore
+			want := append([]string{countNotes, countNotes}, sent...)
+			wantMemberReceived(t, m, append(want, useDefault, countNotes, countNotes))
+			// A restart changes nothing: the pool's database is default before
+			// and after it.
+			m.hangUp()
+			count1(t, db)
+			if got := m.ranIn(t, countNotes).database; got != "default" {
+				t.Errorf("after the connection was replaced the statement ran in %q, want default", got)
+			}
+			if got := m.received(); len(got) != 2 || !reflect.DeepEqual(got[1], []string{countNotes}) {
+				t.Errorf("the replacing connection received %q, want the statement alone", got[1:])
+			}
+		})
+	}
+}
+
+// A connection that cannot be taken back to `default` is dropped, like one
+// that cannot be taken back to the DSN's database: the next statement runs
+// on a connection that is there.
+func TestAConnectionThatCannotGoBackToTheDefaultDatabaseIsDropped(t *testing.T) {
 	m := fakeMembers(t, "a")[0]
 	db := memberDB(t, m, "")
 	ctx := context.Background()
-	count1(t, db)
 	if _, err := db.ExecContext(ctx, "USE other"); err != nil {
 		t.Fatal(err)
 	}
-	count1(t, db)
-	wantMemberReceived(t, m, []string{countNotes, "USE other", countNotes})
+	m.refuseUse.Store(true)
+	if _, err := db.ExecContext(ctx, addNote); err != nil {
+		t.Fatalf("%s: %v", addNote, err)
+	}
+	wantMemberReceived(t, m, []string{"USE other", `USE "default"`}, []string{addNote})
+	if got := m.ranIn(t, addNote).database; got != "default" {
+		t.Errorf("the statement ran in %q, want default", got)
+	}
 }
 
 // What the driver reads as a USE: exactly one `USE [DATABASE] <name>`, the

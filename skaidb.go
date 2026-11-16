@@ -368,9 +368,10 @@ type conn struct {
 	// Set by the context watcher when the caller cancelled: the I/O error
 	// that follows is the caller's doing, not a member failure.
 	cancelled atomic.Bool
-	// The session database: home is the DSN's ("" when it names none),
-	// entered on every dial; database is where the session is as far as the
-	// driver can tell — home, until a USE the server accepted went by (see
+	// The session database: home is the pool's — the DSN's, entered on every
+	// dial, or the one every session starts in (defaultDatabase) when the
+	// DSN names none; database is where the session is as far as the driver
+	// can tell — home, until a USE the server accepted went by (see
 	// noteUse). ResetSession takes a connection that differs back to home
 	// before the pool hands it to its next borrower.
 	home, database string
@@ -396,14 +397,14 @@ func (c *conn) IsValid() bool {
 // while it sat idle is closed (driver.ErrBadConn) instead of handed out, and
 // the statement runs on another connection.
 //
-// It is also where a connection goes back to the DSN's database. A USE is
+// It is also where a connection goes back to the pool's database. A USE is
 // the session's: the borrower that sent one — on a *sql.Conn it held, or
 // through the *sql.DB — left this connection, and no other, in a database
 // the pool was not opened on, and the next borrower's statements would run
-// there. The DSN's database is entered again first; a connection that cannot
-// be taken back is closed rather than handed out. A DSN that names no
-// database gives nothing to go back to, and such a connection stays where
-// its last USE left it.
+// there. The pool's database is entered again first — the DSN's, or
+// `default` when the DSN names none, which is where every other connection
+// of such a pool is and where the one dialled after a restart will be; a
+// connection that cannot be taken back is closed rather than handed out.
 func (c *conn) ResetSession(ctx context.Context) error {
 	if !c.IsValid() {
 		return driver.ErrBadConn
@@ -414,7 +415,7 @@ func (c *conn) ResetSession(ctx context.Context) error {
 		c.retire()
 		return driver.ErrBadConn
 	}
-	if c.home != "" && c.database != c.home {
+	if c.database != c.home {
 		finish := c.applyContext(ctx)
 		_, err := c.exec(useSQL(c.home))
 		if finish(err) != nil {
@@ -422,6 +423,17 @@ func (c *conn) ResetSession(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// defaultDatabase is the database every session starts in: where a
+// connection is when nothing has entered another, and the home of a pool
+// whose DSN names none.
+const defaultDatabase = "default"
+
+// newConn is a connection in the state a session starts in.
+func newConn(nc net.Conn, consistency byte) *conn {
+	return &conn{nc: nc, consistency: consistency, stmtLevel: consistency,
+		prepared: map[string]preparedStmt{}, home: defaultDatabase, database: defaultDatabase}
 }
 
 // useSQL is the statement that enters database name.
@@ -725,7 +737,7 @@ func dialOneDeadline(cfg config, addr string, deadline time.Time) (*conn, error)
 		}
 		nc = tc
 	}
-	c := &conn{nc: nc, consistency: cfg.consistency, stmtLevel: cfg.consistency, prepared: map[string]preparedStmt{}}
+	c := newConn(nc, cfg.consistency)
 	var herr error
 	if cfg.certAuth {
 		herr = c.handshakeCertificate(cfg.user)

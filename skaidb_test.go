@@ -232,8 +232,7 @@ func fakeServer(t *testing.T, script func(s net.Conn)) *conn {
 		ln.Close()
 		<-done
 	})
-	return &conn{nc: nc, consistency: consistencyQuorum, stmtLevel: consistencyQuorum,
-		prepared: map[string]preparedStmt{}}
+	return newConn(nc, consistencyQuorum)
 }
 
 func serverFrame(payload []byte) []byte {

@@ -34,6 +34,13 @@ import (
 // oldServer answers SHOW ENDPOINTS with a parse error; conflict refuses
 // every COMMIT with a transaction conflict; refuseUse refuses every USE. It
 // keeps what each connection sent, in order (received).
+//
+// It keeps each connection's session too, as the server does — the database
+// a USE entered ("default" to begin with), a SET CONSISTENCY override, a SET
+// SCAN BUDGET, an open transaction — and what it was when each statement
+// arrived (ranIn). A SELECT under a scan budget is refused, as a scan is on
+// the server; refuseDefault refuses SET CONSISTENCY DEFAULT, as a server
+// before 0.349 does.
 type fakeMember struct {
 	name      string
 	endpoint  string
@@ -48,10 +55,57 @@ type fakeMember struct {
 	refuseUse atomic.Bool
 	listings  atomic.Int64 // SHOW ENDPOINTS asked
 
+	refuseDefault atomic.Bool
+
 	mu      sync.Mutex
 	listing func() []listedEndpoint
 	stmts   [][]string // statements received, per connection in accept order
 	socks   []net.Conn // the member's end of each connection, in accept order
+	ran     map[string]fakeSession
+}
+
+// fakeSession is a connection's session state on a fakeMember.
+type fakeSession struct {
+	database    string
+	consistency string // the SET CONSISTENCY override; "" for none
+	scanBudget  bool
+	transaction bool
+}
+
+// apply is what a statement the member accepted does to the session.
+func (f *fakeSession) apply(text string) {
+	if i := strings.Index(text, "--"); i >= 0 {
+		text = text[:i]
+	}
+	w := strings.Fields(strings.TrimSuffix(strings.TrimSpace(text), ";"))
+	up := strings.Fields(strings.ToUpper(strings.Join(w, " ")))
+	switch {
+	case len(up) >= 2 && up[0] == "USE":
+		f.database = strings.Trim(w[len(w)-1], `"`)
+	case len(up) >= 3 && up[0] == "SET" && up[1] == "CONSISTENCY":
+		if f.consistency = up[2]; up[2] == "DEFAULT" {
+			f.consistency = ""
+		}
+	case len(up) >= 4 && up[0] == "SET" && up[1] == "SCAN" && up[2] == "BUDGET":
+		f.scanBudget = up[3] != "DEFAULT"
+	case len(up) >= 1 && up[0] == "BEGIN":
+		f.transaction = true
+	case len(up) >= 1 && (up[0] == "COMMIT" || up[0] == "ROLLBACK"):
+		f.transaction = false
+	}
+}
+
+// ranIn is the session the member's connection was in when it last received
+// text: where the statement ran, and under which settings.
+func (m *fakeMember) ranIn(t *testing.T, text string) fakeSession {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	f, ok := m.ran[text]
+	if !ok {
+		t.Fatalf("the member never received %q", text)
+	}
+	return f
 }
 
 // received is what each connection sent the member, in accept order.
@@ -149,6 +203,7 @@ func (m *fakeMember) serve(conn int, s net.Conn) {
 	if fakeWrite(s, append([]byte{13, 1}, refHMAC(refHMAC(m.salted, []byte("Server Key")), am)...)) != nil {
 		return
 	}
+	session := fakeSession{database: "default"}
 	for {
 		req, err := fakeRead(s)
 		if err != nil {
@@ -164,11 +219,19 @@ func (m *fakeMember) serve(conn int, s net.Conn) {
 		text := string(req[6 : 6+n])
 		m.mu.Lock()
 		m.stmts[conn] = append(m.stmts[conn], text)
+		if m.ran == nil {
+			m.ran = map[string]fakeSession{}
+		}
+		m.ran[text] = session
 		m.mu.Unlock()
 		var resp []byte
 		switch {
 		case strings.HasPrefix(text, "USE ") && m.refuseUse.Load():
 			resp = appendStr([]byte{3}, "database does not exist")
+		case text == "SET CONSISTENCY DEFAULT" && m.refuseDefault.Load():
+			resp = appendStr([]byte{3}, "parse error: SET CONSISTENCY takes ONE, QUORUM, or ALL")
+		case strings.HasPrefix(text, "SELECT") && session.scanBudget:
+			resp = appendStr([]byte{3}, "resource limit: scan budget exceeded (2 rows examined)")
 		case text == "SHOW ENDPOINTS":
 			m.listings.Add(1)
 			m.mu.Lock()
@@ -192,6 +255,9 @@ func (m *fakeMember) serve(conn int, s net.Conn) {
 			resp = fakeRowsFrame([]string{"member"}, [][]any{{m.name}})
 		default:
 			resp = binary.LittleEndian.AppendUint64([]byte{1}, 1)
+		}
+		if resp[0] != 3 {
+			session.apply(text)
 		}
 		if fakeWrite(s, resp) != nil {
 			return

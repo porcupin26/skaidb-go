@@ -246,8 +246,7 @@ func (l *lossy) Connect(context.Context) (driver.Conn, error) {
 	<-l.accepted
 	m := &mortal{Conn: nc}
 	m.left.Store(-1)
-	c := &conn{nc: m, consistency: consistencyQuorum, stmtLevel: consistencyQuorum,
-		prepared: map[string]preparedStmt{}}
+	c := newConn(m, consistencyQuorum)
 	l.mu.Lock()
 	l.clients = append(l.clients, c)
 	l.mu.Unlock()
