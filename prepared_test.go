@@ -5,6 +5,7 @@ package skaidb
 
 import (
 	"context"
+	"database/sql"
 	"encoding/binary"
 	"fmt"
 	"reflect"
@@ -141,8 +142,59 @@ func TestThreeHundredStatementsOnOneConnectionAreAllBoundTyped(t *testing.T) {
 	}
 }
 
-// A statement kind the server does not prepare is bound as text: the values
-// are written into the statement, which is sent as an ordinary query.
+// A prepare the server refuses because its table is full is the statement's
+// error. It is not answered by sending the statement as text with the
+// values written into it — the remedy for a statement KIND the server does
+// not prepare — which would run it with other types than the caller bound.
+func TestAPrepareRefusedForLackOfRoomIsNotAnsweredWithLiterals(t *testing.T) {
+	ctx := context.Background()
+	const insert = "INSERT INTO t (id, name) VALUES (?, ?)"
+	for name, run := range map[string]func(db *sql.DB) error{
+		"Exec": func(db *sql.DB) error {
+			_, err := db.ExecContext(ctx, insert, 1, "a")
+			return err
+		},
+		"Query": func(db *sql.DB) error {
+			rows, err := db.QueryContext(ctx, insert, 1, "a")
+			if err == nil {
+				rows.Close()
+			}
+			return err
+		},
+		"ExecBatch": func(db *sql.DB) error {
+			_, err := ExecBatch(ctx, db, insert, [][]any{{1, "a"}, {2, "b"}})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := &statementTable{open: map[uint32]string{}}
+			for i := uint32(1); i <= 256; i++ { // somebody filled the table
+				st.open[1000+i] = "held"
+			}
+			c, _ := recordingServer(t, st.handle)
+			db, dials := txDB(t, c)
+			err := run(db)
+			if err == nil || err.Error() != "skaidb: "+tableFull {
+				t.Errorf("err = %v, want the server's refusal", err)
+			}
+			st.mu.Lock()
+			if len(st.literal) != 0 {
+				t.Errorf("the statement was sent as text: %q", st.literal)
+			}
+			// A kind the server does not prepare still takes the text path.
+			delete(st.open, 1001)
+			st.mu.Unlock()
+			// It is a statement error: the connection stays in the pool.
+			if _, err := db.ExecContext(ctx, "DELETE FROM t WHERE id = ?", 1); err != nil {
+				t.Fatalf("the next statement: %v", err)
+			}
+			wantPooled(t, db, c, dials)
+		})
+	}
+}
+
+// The remedy stays for what it is for: a statement kind the server does not
+// prepare is bound as text.
 func TestAStatementKindThatCannotBePreparedIsStillBoundAsText(t *testing.T) {
 	c, rec := recordingServer(t, func(req []byte) [][]byte {
 		if req[0] == 2 {

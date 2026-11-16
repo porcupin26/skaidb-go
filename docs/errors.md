@@ -49,6 +49,7 @@ messages below are stable within the 1.x line.
 |---|---|
 | `skaidb: <server message>` | the server rejected or failed the statement: syntax, unknown table or column, constraint violation, permission, scan budget exceeded, read/write quorum unavailable… The text is the server's |
 | `skaidb: statement expects N parameters, got M` | argument count vs. the server's parse |
+| `skaidb: too many prepared statements (max 256); close some first` | the server has no room to prepare the statement on this connection. The driver's cache stays below the server's limit, so this means statements were prepared past it; the statement did not run, and is not sent as text instead |
 | `skaidb: more placeholders than parameters`, `skaidb: more parameters than placeholders` | count mismatch on the client-side text path |
 | `skaidb: cannot bind value of type T` | an unsupported argument type (struct, chan…), or a composite on the client-side path |
 | `skaidb: cannot bind NaN/Infinity` | non-finite float |

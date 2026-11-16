@@ -1398,10 +1398,24 @@ func (c *conn) prepareServer(sqlText string) (uint32, int, bool, error) {
 		}
 		return id, n, false, nil
 	case 3: // Error
-		return 0, 0, false, fmt.Errorf("%w: %s", errUnpreparable, r.text())
+		msg := r.text()
+		if strings.HasPrefix(msg, preparedTableFull) {
+			// Not a statement the server will not prepare: one it has no
+			// room for. That is the statement's error. Bound as text it
+			// would run with other types than the caller's arguments have.
+			return 0, 0, false, serverError(msg)
+		}
+		return 0, 0, false, fmt.Errorf("%w: %s", errUnpreparable, msg)
 	}
 	return 0, 0, false, fmt.Errorf("skaidb: unexpected prepare response")
 }
+
+// preparedTableFull starts the server's refusal of a prepare on a connection
+// that already holds as many statements as the server keeps for one (256):
+// "too many prepared statements (max 256); close some first". The cache
+// above stays below that and closes what it does not keep, so the refusal
+// means the statements were prepared past it.
+const preparedTableFull = "too many prepared statements"
 
 // closePrepared frees a prepared statement's server slot (OP_CLOSE),
 // best-effort: a failure only means the slot dies with the connection. A

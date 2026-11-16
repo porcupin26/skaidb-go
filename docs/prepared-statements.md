@@ -35,7 +35,15 @@ lands on. There is nothing to close or invalidate: a connection's cache
 goes away with it. A statement prepared once the cache is full is used for
 its one execution and then closed on the server (`OP_CLOSE`), so a
 connection that runs thousands of distinct statement texts stays under the
-server's limit of 256 open statements per connection.
+server's limit of 256 open statements per connection — and every one of
+them is still bound typed. `Stmt.Close` sends nothing: the statement is the
+connection's cache entry, shared with every other statement of that text.
+
+Should the server refuse a prepare all the same because the connection's
+table is full (`skaidb: too many prepared statements (max 256); close some
+first`), that is the statement's error. The text path is for statement
+kinds the server does not prepare; it is not taken here, where it would
+run the statement with other types than its arguments have.
 
 Consequence: a `*sql.Stmt` and `db.Exec(text, args...)` in a loop cost the
 same. Use whichever reads better.
