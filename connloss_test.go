@@ -1066,3 +1066,44 @@ func TestAStatementOnADeadConnectionReturnsWhileRowsAreOpen(t *testing.T) {
 		})
 	}
 }
+
+// A buffered result the transaction's function left open does not stand in
+// the way of the COMMIT, but (*sql.Conn).Close waits for it: Transaction
+// would sit there, its transaction long committed, until somebody closed
+// the rows. It returns when the transaction is over; the connection goes
+// back to the pool when the rows are closed.
+func TestTransactionDoesNotWaitForRowsItsFunctionLeftOpen(t *testing.T) {
+	l, db := listServer(t)
+	ctx := context.Background()
+	left := make(chan *sql.Rows, 1)
+	err, returned := within(2*time.Second, func() error {
+		return Transaction(ctx, db, func(conn *sql.Conn) error {
+			rows, err := conn.QueryContext(ctx, list)
+			if err != nil {
+				return err
+			}
+			rows.Next()
+			left <- rows
+			_, err = conn.ExecContext(ctx, updateSQL)
+			return err
+		})
+	})
+	rows := <-left
+	if !returned {
+		t.Error("Transaction is waiting for the function's rows to be closed")
+	} else if err != nil {
+		t.Errorf("Transaction: %v", err)
+	}
+	l.wantReceived([]string{"BEGIN", list, updateSQL, "COMMIT"})
+	rows.Close()
+	waitFor(t, "the connection to be back in the pool", func() bool {
+		s := db.Stats()
+		return s.OpenConnections == 1 && s.InUse == 0
+	})
+	// Healthy, and with no transaction open: the pool's next statement
+	// takes it.
+	if _, err := db.ExecContext(ctx, "DELETE FROM audit"); err != nil {
+		t.Fatal(err)
+	}
+	l.wantReceived([]string{"BEGIN", list, updateSQL, "COMMIT", "DELETE FROM audit"})
+}

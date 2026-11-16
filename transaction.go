@@ -127,7 +127,8 @@ func newTxConfig(opts []TxOption) (txConfig, error) {
 // caller's to capture, as left above; after a retry it holds what the last
 // run set.
 //
-// Close every *sql.Rows body opens before it returns. A streamed result
+// Close every *sql.Rows body opens before it returns: the connection is not
+// back in the pool until they are closed. A streamed result
 // (WithStreaming) keeps the connection to itself until it is closed, so
 // with one left open neither COMMIT nor ROLLBACK can be sent: the
 // transaction is ended the only way left — its connection is closed, which
@@ -176,11 +177,12 @@ func Transaction(ctx context.Context, db *sql.DB, body func(conn *sql.Conn) erro
 // release puts Transaction's connection back in the pool.
 //
 // (*sql.Conn).Close waits for every *sql.Rows opened on the connection to be
-// closed. After a body that left a streamed one open that is not the
-// caller's wait: the transaction is over and the connection retired
-// (runBody), and the pool drops it whenever the rows are closed.
+// closed. After a body that left one open that is not the caller's wait:
+// the transaction is over, and the connection goes back to the pool — or,
+// retired because the rows were a stream (runBody), is dropped by it —
+// whenever the rows are closed.
 func release(c *sql.Conn) {
-	if dc := driverConn(c); dc != nil && dc.streaming.Load() {
+	if dc := driverConn(c); dc != nil && dc.results.Load() > 0 {
 		go c.Close()
 		return
 	}

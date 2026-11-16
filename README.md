@@ -651,7 +651,8 @@ statement, at once and on the same connection, up to three runs in all.
   what it needs inside the transaction, and do nothing outside the database
   that a second run would do twice. A value it computes is yours to
   capture, as `left` above; after a retry it holds what the last run set.
-- **Close every `*sql.Rows` before returning.** A
+- **Close every `*sql.Rows` before returning.** The connection is not back
+  in the pool until they are closed. A
   [streamed](#streaming-large-results) result keeps the connection to
   itself until it is closed, so with one left open neither `COMMIT` nor
   `ROLLBACK` can be sent. The transaction is then ended the only way left:
