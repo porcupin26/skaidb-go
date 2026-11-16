@@ -367,6 +367,38 @@ func TestARetiredConnectionClosesItsSocket(t *testing.T) {
 				t.Fatal("the unexpected answer was taken for the batch's")
 			}
 		}},
+		// An answer of a kind the request cannot have: whatever it answers,
+		// or begins, it is not this statement's, and the next statement on
+		// the connection would read what follows it as its own.
+		{"an answer that is not a prepare's", func([]byte) [][]byte {
+			return [][]byte{serverFrame([]byte{9})}
+		}, func(t *testing.T, c *conn) {
+			_, err := c.ExecContext(ctx, "INSERT INTO t (id) VALUES (?)", []driver.NamedValue{{Ordinal: 1, Value: int64(1)}})
+			if err == nil || !strings.Contains(err.Error(), "unexpected prepare response") {
+				t.Fatalf("err = %v, want the unexpected prepare response", err)
+			}
+		}},
+		{"an answer that is not a statement's", func([]byte) [][]byte {
+			return [][]byte{serverFrame([]byte{9})}
+		}, func(t *testing.T, c *conn) {
+			if _, err := c.ExecContext(ctx, "DELETE FROM t", nil); err == nil || !strings.Contains(err.Error(), "unknown response tag 9") {
+				t.Fatalf("err = %v, want the unknown response tag", err)
+			}
+		}},
+		{"an answer that is not a query's", func([]byte) [][]byte {
+			return [][]byte{serverFrame([]byte{9})}
+		}, func(t *testing.T, c *conn) {
+			if _, err := c.QueryContext(ctx, "SELECT id FROM t", nil); err == nil || !strings.Contains(err.Error(), "unknown response tag 9") {
+				t.Fatalf("err = %v, want the unknown response tag", err)
+			}
+		}},
+		{"an answer that does not open a stream", func([]byte) [][]byte {
+			return [][]byte{serverFrame([]byte{9})}
+		}, func(t *testing.T, c *conn) {
+			if _, err := c.streamQuery("SELECT id FROM t", nil); err == nil || !strings.Contains(err.Error(), "unexpected response to stream request") {
+				t.Fatalf("err = %v, want the unexpected response", err)
+			}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var c *conn
@@ -408,6 +440,33 @@ func TestARetiredConnectionClosesItsSocket(t *testing.T) {
 			}
 		})
 	}
+}
+
+// What an answer of no known kind costs when the connection stays in the
+// pool: the frame behind it is still on the socket, and the pool's next
+// statement reads it as its own answer — here a count of rows affected that
+// belongs to nothing it ran. The connection is dropped instead, and the next
+// statement gets its answer on another.
+func TestAnAnswerOfNoKnownKindLeavesNothingForTheNextStatement(t *testing.T) {
+	const odd = "DELETE FROM t WHERE id = 1"
+	l, db := lossyServer(t, func(_ int, sql string) []byte {
+		if sql == odd {
+			return append(serverFrame([]byte{9}), mutationFrame(7)...)
+		}
+		return nil
+	})
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, odd); err == nil || !strings.Contains(err.Error(), "unknown response tag 9") {
+		t.Fatalf("err = %v, want the unknown response tag", err)
+	}
+	res, err := db.ExecContext(ctx, updateSQL)
+	if err != nil {
+		t.Fatalf("the next statement: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		t.Errorf("the next statement affected %d rows: it read the frame left behind the unknown answer", n)
+	}
+	l.wantReceived([]string{odd}, []string{updateSQL})
 }
 
 // ---- the opening statement on a dead pooled connection ----------------------

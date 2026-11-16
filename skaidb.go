@@ -1464,6 +1464,10 @@ func (c *conn) prepareServer(sqlText string) (uint32, int, bool, error) {
 		}
 		return 0, 0, false, fmt.Errorf("%w: %s", errUnpreparable, msg)
 	}
+	// Not an answer to a prepare. Whatever it is, the connection is out of
+	// step with the server: what follows on the socket would be read as the
+	// next statement's answer.
+	c.retire()
 	return 0, 0, false, fmt.Errorf("skaidb: unexpected prepare response")
 }
 
@@ -1639,8 +1643,17 @@ func (c *conn) readRows(r *reader) (driver.Rows, error) {
 	case 3:
 		return nil, serverError(r.text())
 	default:
-		return nil, fmt.Errorf("skaidb: unknown response tag %d", tag)
+		c.retire() // see unknownTag
+		return nil, unknownTag(tag)
 	}
+}
+
+// unknownTag is the error for an answer whose first byte is no response tag
+// the statement can have. The connection it came on is retired: the driver
+// cannot tell where that answer ends, so whatever is behind it on the socket
+// would be read as the answer to the next statement.
+func unknownTag(tag byte) error {
+	return fmt.Errorf("skaidb: unknown response tag %d", tag)
 }
 
 func (c *conn) exec(sqlText string) (driver.Result, error) {
@@ -1666,7 +1679,8 @@ func (c *conn) readResult(r *reader) (driver.Result, error) {
 	case 3:
 		return nil, serverError(r.text())
 	default:
-		return nil, fmt.Errorf("skaidb: unknown response tag %d", tag)
+		c.retire() // see unknownTag
+		return nil, unknownTag(tag)
 	}
 }
 
@@ -1815,6 +1829,7 @@ func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Row
 		}
 		return nil, serverError(msg)
 	}
+	c.retire() // not an answer to this request: see unknownTag
 	return nil, fmt.Errorf("skaidb: unexpected response to stream request")
 }
 
