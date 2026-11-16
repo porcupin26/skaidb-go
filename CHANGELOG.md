@@ -4,6 +4,92 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.4.2] — 2026-11-16
+
+### Fixed
+- **A connection the server closed while it sat idle cost a statement.**
+  After a member restart, a failover or an idle timeout, the first
+  statement on each idle connection could fail with `skaidb: connection
+  lost mid-statement (statement may or may not have applied)`: across a
+  real network the write to a dead socket succeeds and only the read of
+  the answer fails, when it is too late to send the statement elsewhere.
+  The driver now looks at the socket before it writes a request and before
+  the pool hands a connection out — one non-blocking read, no round trip,
+  under TLS too. A connection found closed or reset is dropped with
+  nothing sent: the statement runs on another connection, `db.Conn` gives
+  one that works, and `Transaction` opens on one. On a `*sql.Conn` you
+  already hold, such a statement returns `driver.ErrBadConn` — nothing was
+  sent — and inside a transaction that is a lost transaction, as before.
+  A connection found closed this way does not count against its member.
+  The look is made on Linux, macOS, the BSDs and Solaris.
+- **A `USE` sent through the `*sql.DB` when the DSN names no database**
+  stayed on the one pooled connection that ran it: statements ran in that
+  database or in `default` depending on the connection they got, and in
+  `default` on all of them after a restart. The pool's database is now
+  `default` when the DSN names none, and a connection is taken back to it
+  (`USE "default"`) before its next borrower gets it, as it already was
+  taken back to the DSN's database.
+- **A borrower's `SET CONSISTENCY` and `SET SCAN BUDGET` reached the next
+  borrower.** Sent on a `*sql.Conn` or through the `*sql.DB`, a session
+  setting stayed on its pooled connection: the next borrower's scan was
+  refused for a budget it never set, or its statements ran at a
+  consistency it did not ask for. The driver now notes a setting the
+  server accepted and clears it (`SET SCAN BUDGET DEFAULT`,
+  `SET CONSISTENCY DEFAULT`) before the connection's next borrower; a
+  connection it cannot clear — a server before 0.349 has no
+  `SET CONSISTENCY DEFAULT` — is closed instead. A borrower that changed
+  nothing costs no round trip.
+- **A transaction left open reached the next borrower.** A `BEGIN` sent
+  through the `*sql.DB`, or a `*sql.Conn` closed between its `BEGIN` and
+  its `COMMIT`, left the transaction open on a pooled connection, and the
+  pool's next statements ran inside it: they reported success, no other
+  session saw them, and they were never committed. The driver now notes a
+  transaction a statement opened until its `COMMIT` or `ROLLBACK` is
+  answered; a connection that comes back with one open is closed, which
+  ends the transaction on the server.
+- **A transaction written by hand, when its connection was lost.** On a
+  `*sql.Conn` whose connection the driver had retired inside the
+  transaction, `ROLLBACK` failed with `skaidb: connection is retired: …`
+  and so did `COMMIT`, which does not say whether anything was committed.
+  `ROLLBACK` now succeeds without being sent — the server dropped the
+  transaction with the connection — and `COMMIT` fails with
+  `skaidb: transaction not committed: …`, the error `Transaction` returns
+  for it; a `COMMIT` that finds the connection gone returns the same
+  instead of a bare `driver: bad connection`. Lost under the `COMMIT`
+  itself, the error still says that the outcome is unknown.
+- **A `USE` written with other whitespace than the driver knew** — a
+  no-break space pasted in with the statement, any Unicode space, a
+  vertical tab, a form feed, all of which the server accepts — moved the
+  session unnoticed, and the connection went to its next borrower in that
+  database. The driver reads a `USE` as the server's lexer does.
+- **An answer of a kind the request cannot have left the connection in
+  the pool.** After `skaidb: unexpected prepare response`, `skaidb: unknown
+  response tag N` or `skaidb: unexpected response to stream request`, the
+  next statement on that connection could read what followed as its own
+  answer. The connection is now retired, as the documentation said.
+- **A value the driver could not decode was read as `NULL`.** A value of
+  a type this driver version does not know — from a newer server — or one
+  cut short came back as `NULL`, `0` or `[null]` with no error. The
+  statement now fails with `skaidb: unknown value tag N` or
+  `skaidb: truncated server message`.
+
+### Upgrade notes
+- **Session state no longer carries over from one borrower of a pooled
+  connection to the next.** On a pool without a database in the DSN, a
+  `USE` sent through the `*sql.DB` used to stick to one connection; it is
+  now over when the statement returns, like `SET CONSISTENCY` and
+  `SET SCAN BUDGET` sent that way. Choose the database in the DSN, or send
+  `USE` and the settings on a `*sql.Conn`, where they hold for as long as
+  you keep it.
+- **`BEGIN`, statements and `COMMIT` each sent through the `*sql.DB` are
+  not a transaction** — they never were on a pool of more than one
+  connection. The `COMMIT` now fails with the server's `no transaction in
+  progress` on a pool of one too. Use `skaidb.Transaction`, or one
+  `*sql.Conn`.
+- A statement on a `*sql.Conn` whose connection was closed while idle
+  returns `driver.ErrBadConn` where it could return `skaidb: connection
+  lost mid-statement …`.
+
 ## [1.4.1] — 2026-11-16
 
 ### Fixed
