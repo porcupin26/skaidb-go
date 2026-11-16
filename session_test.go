@@ -8,6 +8,9 @@ package skaidb
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"strings"
 	"testing"
 )
 
@@ -294,6 +297,117 @@ func TestAnEndedTransactionLeavesItsConnectionInThePool(t *testing.T) {
 		exec1(t, db, addNote)
 		wantMemberReceived(t, m, []string{"BEGIN", updateSQL, "COMMIT", "BEGIN", updateSQL, "COMMIT", addNote})
 	})
+}
+
+// ---- a *sql.Conn whose connection is lost ------------------------------------
+
+// The other half of "a setting holds for the *sql.Conn it was sent on":
+// database/sql never puts another connection under a *sql.Conn, and the
+// driver never re-dials one. So when the connection is lost — while it sat
+// idle, as after a restart — the next statement fails. It is not run on a
+// new session, where the scan budget and the consistency its owner set
+// would be silently gone. A *sql.Conn taken afterwards is a pool connection
+// like any other: nothing of the lost one is sent on it.
+func TestAStatementOnALostConnIsNotRunWithoutItsSettings(t *testing.T) {
+	ctx := context.Background()
+	for _, how := range append(closings, struct {
+		name  string
+		close func(l *lossy, n int)
+	}{"dead at the next write", (*lossy).kill}) {
+		t.Run(how.name, func(t *testing.T) {
+			l, db := lossyServer(t, nil)
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			exec1(t, conn, "USE app", setBudget, setConsistency)
+			how.close(l, 0)
+			if _, err := conn.ExecContext(ctx, debit); !errors.Is(err, driver.ErrBadConn) {
+				t.Fatalf("the statement on the lost connection: err = %v, want driver.ErrBadConn", err)
+			}
+			if _, err := conn.ExecContext(ctx, debit); !errors.Is(err, sql.ErrConnDone) {
+				t.Errorf("the statement after it: err = %v, want sql.ErrConnDone", err)
+			}
+			l.wantReceived([]string{"USE app", setBudget, setConsistency})
+			next, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer next.Close()
+			exec1(t, next, debit)
+			l.wantReceived([]string{"USE app", setBudget, setConsistency}, []string{debit})
+		})
+	}
+}
+
+// A USE is never held hostage by the database it leaves, because the driver
+// enters the database of a USE on no connection but the one the USE was
+// sent on. The database a *sql.Conn was in is dropped and the connection is
+// lost: the statements on that *sql.Conn fail with the connection, and the
+// next *sql.Conn starts in the pool's database — a USE sent on it is the
+// first thing the server hears, and decides where its statements run.
+func TestAUseIsNotEnteredAgainOnAnotherConnection(t *testing.T) {
+	m := fakeMembers(t, "a")[0]
+	db := memberDB(t, m, "")
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	exec1(t, conn, "USE app", addNote)
+	m.refuseUse.Store(true) // app is dropped: nobody can enter it any more ...
+	m.hangUp()              // ... and the connection is lost
+	if _, err := conn.ExecContext(ctx, addNote); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("the statement on the lost connection: err = %v, want driver.ErrBadConn", err)
+	}
+	if _, err := conn.ExecContext(ctx, "USE other"); !errors.Is(err, sql.ErrConnDone) {
+		t.Errorf("USE on the lost *sql.Conn: err = %v, want sql.ErrConnDone", err)
+	}
+	m.refuseUse.Store(false) // other exists
+	next, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("the next *sql.Conn: %v", err)
+	}
+	defer next.Close()
+	exec1(t, next, "USE other", addNote)
+	if got := m.ranIn(t, addNote).database; got != "other" {
+		t.Errorf("the statement behind the new USE ran in %q, want other", got)
+	}
+	wantMemberReceived(t, m, []string{"USE app", addNote}, []string{"USE other", addNote})
+}
+
+// The pool's own database is another matter: it is what the DSN says every
+// borrower gets. When it cannot be entered — it was dropped — the pool has
+// no connection to hand out: a statement, a checkout and a USE alike fail
+// with the server's refusal, and nothing is run in another database. A pool
+// is opened on a database that exists.
+func TestAPoolWhoseDatabaseIsGoneHandsOutNoConnection(t *testing.T) {
+	m := fakeMembers(t, "a")[0]
+	db := memberDB(t, m, "app")
+	ctx := context.Background()
+	exec1(t, db, addNote)
+	m.refuseUse.Store(true)
+	m.hangUp()
+	gone := func(err error) bool { return err != nil && strings.Contains(err.Error(), "database does not exist") }
+	if _, err := db.ExecContext(ctx, addNote); !gone(err) {
+		t.Errorf("a statement: err = %v, want the refusal of the DSN's database", err)
+	}
+	if conn, err := db.Conn(ctx); !gone(err) {
+		t.Errorf("a checkout: err = %v, want the refusal of the DSN's database", err)
+		if conn != nil {
+			conn.Close()
+		}
+	}
+	if _, err := db.ExecContext(ctx, "USE other"); !gone(err) {
+		t.Errorf("a USE through the pool: err = %v, want the refusal of the DSN's database", err)
+	}
+	for i, c := range m.received()[1:] {
+		if len(c) != 1 || c[0] != useApp {
+			t.Errorf("connection %d received %q, want only the USE that was refused", i+1, c)
+		}
+	}
 }
 
 // What the driver reads as a session statement, besides USE: a text that is
