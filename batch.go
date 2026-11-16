@@ -45,28 +45,24 @@ var _ BatchExecer = (*conn)(nil)
 // ExecBatch runs query once per parameter row on one pooled connection, in
 // one round trip per chunk (see BatchExecer), and returns the total
 // affected-row count. A failure before any byte reached the server is
-// retried on a fresh connection, as database/sql does for its own calls.
+// retried on another connection, as database/sql does for its own calls
+// (see badConnRetry).
 //
 //	n, err := skaidb.ExecBatch(ctx, db, "INSERT INTO t (id, v) VALUES (?, ?)",
 //		[][]any{{1, "a"}, {2, "b"}, {3, "c"}})
 func ExecBatch(ctx context.Context, db *sql.DB, query string, rows [][]any) (int64, error) {
-	var (
-		n   int64
-		err error
-	)
-	for attempt := 0; attempt < 3; attempt++ {
-		var c *sql.Conn
-		c, err = db.Conn(ctx)
+	var retry badConnRetry
+	for {
+		c, err := db.Conn(ctx)
 		if err != nil {
 			return 0, err
 		}
-		n, err = ExecBatchConn(ctx, c, query, rows)
+		n, err := ExecBatchConn(ctx, c, query, rows)
 		c.Close()
-		if !errors.Is(err, driver.ErrBadConn) {
-			break
+		if !retry.again(db, err) {
+			return n, err
 		}
 	}
-	return n, err
 }
 
 // ExecBatchConn is ExecBatch on a connection the caller has pinned with

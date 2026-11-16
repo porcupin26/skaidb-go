@@ -66,10 +66,11 @@ What to know:
 - **Fallbacks.** A statement the server will not prepare (DDL, `CALL`) runs
   text-bound, one request per row; a server older than the batch opcode
   (< 0.87.0) gets one `OP_EXECUTE` per row. Same results, more round trips.
-- **Retries.** `ExecBatch` (the `*sql.DB` form) retries on a fresh
-  connection only when the request never reached the wire, as
-  `database/sql` does for its own calls. Once a request was sent, a lost
-  connection is reported, never retried.
+- **Retries.** `ExecBatch` (the `*sql.DB` form) retries on another
+  connection only when the batch never reached the wire, as `database/sql`
+  does for its own calls — however many idle connections a server restart
+  left dead in the pool. Once a request was sent, a lost connection is
+  reported, never retried.
 
 ## A loop of prepared statements
 

@@ -939,3 +939,35 @@ func TestAStatementWithArgumentsMovesOffADeadPooledConnection(t *testing.T) {
 		}
 	}
 }
+
+// ExecBatch takes its own connection from the pool, as Transaction does,
+// and finds a live one the same way: whatever the number of idle
+// connections that died with the server, and no further than database/sql
+// goes when every connection is dead on arrival.
+func TestExecBatchRunsWhateverTheNumberOfDeadConnections(t *testing.T) {
+	const insert = "INSERT INTO t (id) VALUES (?)"
+	const dead = 5
+	ctx := context.Background()
+	l, db := lossyServer(t, nil)
+	idle(t, db, dead)
+	for i := 0; i < dead; i++ {
+		l.kill(i)
+	}
+	n, err := ExecBatch(ctx, db, insert, [][]any{{1}, {2}})
+	if err != nil || n != 1 {
+		t.Fatalf("with %d dead connections in the pool: n = %d, err = %v", dead, n, err)
+	}
+	if got := l.received(l.dials() - 1); len(got) != 1 || got[0] != insert {
+		t.Errorf("the last connection dialled received %q, want the batch", got)
+	}
+
+	l, _ = lossyServer(t, nil)
+	db = sql.OpenDB(deadOnArrival{l})
+	defer db.Close()
+	if _, err := ExecBatch(ctx, db, insert, [][]any{{1}, {2}}); !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("with every connection dead on arrival: err = %v, want driver.ErrBadConn", err)
+	}
+	if got := l.dials(); got != 3 {
+		t.Errorf("%d connections dialled, want database/sql's 3", got)
+	}
+}
