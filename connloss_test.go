@@ -971,3 +971,98 @@ func TestExecBatchRunsWhateverTheNumberOfDeadConnections(t *testing.T) {
 		t.Errorf("%d connections dialled, want database/sql's 3", got)
 	}
 }
+
+// ---- a result set still open on the connection ------------------------------
+
+const list = "SELECT id FROM accounts"
+
+// listServer answers list with two buffered rows and everything else with a
+// success.
+func listServer(t *testing.T) (*lossy, *sql.DB) {
+	rows := serverFrame(fakeRowsFrame([]string{"id"}, [][]any{{"a"}, {"b"}}))
+	return lossyServer(t, func(_ int, sql string) []byte {
+		if sql == list {
+			return rows
+		}
+		return nil
+	})
+}
+
+// within runs f and reports whether it returned in time, with its error.
+func within(d time.Duration, f func() error) (error, bool) {
+	done := make(chan error, 1)
+	go func() { done <- f() }()
+	select {
+	case err := <-done:
+		return err, true
+	case <-time.After(d):
+		return nil, false
+	}
+}
+
+// A statement on a *sql.Conn that finds the connection dead, while a result
+// set read earlier on that connection is still open — the loop that reads
+// rows and writes one statement per row. driver.ErrBadConn there makes
+// database/sql close the *sql.Conn on the spot, and that close waits for
+// the open rows: the statement never returns, the rows are never closed.
+// Nothing would retry it either — only a pinned connection runs a statement
+// with a result set open — so it is reported as the lost connection it is.
+func TestAStatementOnADeadConnectionReturnsWhileRowsAreOpen(t *testing.T) {
+	ctx := context.Background()
+	for name, run := range map[string]func(db *sql.DB, fn func(*sql.Conn) error) error{
+		"on a *sql.Conn": func(db *sql.DB, fn func(*sql.Conn) error) error {
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				return err
+			}
+			defer conn.Close()
+			return fn(conn)
+		},
+		"in a Transaction": func(db *sql.DB, fn func(*sql.Conn) error) error {
+			return Transaction(ctx, db, fn)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l, db := listServer(t)
+			open := make(chan *sql.Rows, 1)
+			seen := 0
+			err, returned := within(2*time.Second, func() error {
+				return run(db, func(conn *sql.Conn) error {
+					rows, err := conn.QueryContext(ctx, list)
+					if err != nil {
+						return err
+					}
+					defer rows.Close()
+					open <- rows
+					for rows.Next() {
+						seen++
+						l.kill(0)
+						if _, err := conn.ExecContext(ctx, updateSQL); err != nil {
+							return err
+						}
+					}
+					return rows.Err()
+				})
+			})
+			if !returned {
+				t.Error("the statement on the dead connection is waiting for the rows to be closed, in the goroutine that reads them")
+				(<-open).Close() // let it go
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "connection lost before the statement was sent") || errors.Is(err, driver.ErrBadConn) {
+				t.Errorf("err = %v, want the lost connection, and not driver.ErrBadConn", err)
+			}
+			if seen != 1 {
+				t.Errorf("%d rows read before the statement failed, want 1", seen)
+			}
+			if c := l.client(0); c.IsValid() || !socketClosed(c) {
+				t.Error("the dead connection was not retired")
+			}
+			// Without rows open the same failure is database/sql's to retry:
+			// the pool's next statement runs on a new connection.
+			if _, err := db.ExecContext(ctx, "DELETE FROM audit"); err != nil {
+				t.Fatalf("an ordinary statement afterwards: %v", err)
+			}
+		})
+	}
+}

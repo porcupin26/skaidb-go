@@ -367,6 +367,11 @@ type conn struct {
 	// Set by the context watcher when the caller cancelled: the I/O error
 	// that follows is the caller's doing, not a member failure.
 	cancelled atomic.Bool
+	// Result sets handed to database/sql and not closed yet. While there is
+	// one, the connection is pinned — a *sql.Conn whose owner is still
+	// reading rows, or has left them open — and database/sql cannot close
+	// it: see transportErr.
+	results atomic.Int32
 }
 
 // IsValid implements driver.Validator: database/sql asks before putting a
@@ -437,6 +442,15 @@ func (c *conn) transportErr(err error, sent bool) error {
 	}
 	c.retire()
 	if !sent {
+		if c.results.Load() > 0 {
+			// driver.ErrBadConn makes database/sql close a *sql.Conn on the
+			// spot, and that close waits for every *sql.Rows open on it —
+			// for good, when the caller is the goroutine reading them, one
+			// statement per row. It would buy nothing here either: only a
+			// pinned connection runs a statement with a result set open,
+			// and database/sql does not retry on those.
+			return fmt.Errorf("skaidb: connection lost before the statement was sent: %w", err)
+		}
 		return driver.ErrBadConn
 	}
 	return fmt.Errorf("skaidb: connection lost mid-statement (statement may or may not have applied): %w", err)
@@ -1017,6 +1031,16 @@ func (c *conn) applyContext(ctx context.Context) func(error) error {
 }
 
 func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	rs, err := c.queryContext(ctx, query, args)
+	if r, ok := rs.(*rows); ok && err == nil {
+		// database/sql closes every result set it is handed, once.
+		r.owner = c
+		c.results.Add(1)
+	}
+	return rs, err
+}
+
+func (c *conn) queryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	lvl, err := c.consistencyFor(ctx)
 	if err != nil {
 		return nil, err
@@ -1530,6 +1554,9 @@ type rows struct {
 	// Ends the statement's context watcher/deadline; set only on the
 	// streaming path, where the statement outlives QueryContext.
 	release func(error) error
+	// The connection that counts this result set as open (conn.results)
+	// until Close; nil for one database/sql never saw.
+	owner *conn
 }
 
 // streamQuery issues OP_QUERY_STREAM and returns rows that pull chunks from
@@ -1798,6 +1825,10 @@ func (r *rows) Close() error {
 	if r.release != nil {
 		r.release(nil)
 		r.release = nil
+	}
+	if r.owner != nil {
+		r.owner.results.Add(-1)
+		r.owner = nil
 	}
 	return nil
 }
