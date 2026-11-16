@@ -78,7 +78,8 @@ messages below are stable within the 1.x line.
 | the socket failed before the request was written, on a `*sql.Conn` with a `*sql.Rows` still open | `skaidb: connection lost before the statement was sent: <io error>` — `database/sql` retries nothing on a `*sql.Conn`, and `driver.ErrBadConn` there would make it wait for those rows to be closed | on another connection: nothing was sent |
 | the socket failed **after** the request was written | `skaidb: connection lost mid-statement (statement may or may not have applied): <io error>` | only if idempotent |
 | the context expired / was cancelled | `context.DeadlineExceeded` / `context.Canceled` (via `errors.Is`); the connection is retired | only if idempotent |
-| a corrupt or unexpected frame | `skaidb: truncated server message`, `skaidb: unknown response tag N`, `skaidb: unexpected prepare response`, `skaidb: unexpected response to stream request`, `skaidb: unexpected response tag N to a batch`, `skaidb: unknown value tag N`, `skaidb: unexpected frame in stream`; the connection is retired | investigate; this indicates a protocol mismatch |
+| an unexpected frame | `skaidb: unknown response tag N`, `skaidb: unexpected prepare response`, `skaidb: unexpected response to stream request`, `skaidb: unexpected response tag N to a batch`, `skaidb: unexpected frame in stream`; the connection is retired | investigate; this indicates a protocol mismatch |
+| an answer that cannot be decoded | `skaidb: truncated server message`, or `skaidb: unknown value tag N` for a value of a type this driver does not know (a newer server's); the statement fails — the value is never read as NULL — and inside a stream the connection is retired | investigate; upgrade the driver for a type it does not know |
 
 "Retired" means the driver closes the connection's socket there and then
 — the server ends the session, and with it a transaction the session had

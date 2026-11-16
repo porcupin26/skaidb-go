@@ -1078,7 +1078,8 @@ context errors, `driver.ErrBadConn` — and this package's
 | connection lost after the request was written | `skaidb: connection lost mid-statement (statement may or may not have applied): <io error>` — the write's fate is unknown; the driver does not retry |
 | deadline / cancellation | `context.DeadlineExceeded` / `context.Canceled` (via `errors.Is`) |
 | a statement on a `*sql.Conn` whose connection was retired by an earlier failure | `skaidb: connection is retired: an earlier statement on it failed or was cancelled part-way and its socket is closed — nothing was sent` |
-| corrupt or unexpected frame | `skaidb: truncated server message`, `skaidb: unknown response tag N`, `skaidb: unexpected prepare response`, `skaidb: unexpected response to stream request`, `skaidb: unexpected response tag N to a batch`, `skaidb: unexpected frame in stream` — the connection is retired |
+| unexpected frame | `skaidb: unknown response tag N`, `skaidb: unexpected prepare response`, `skaidb: unexpected response to stream request`, `skaidb: unexpected response tag N to a batch`, `skaidb: unexpected frame in stream` — the connection is retired |
+| an answer that cannot be decoded | `skaidb: truncated server message`, `skaidb: unknown value tag N` (a value of a type this driver does not know) — the statement fails, the value is never read as NULL; inside a stream the connection is retired |
 
 Errors ending a **stream** mid-way arrive from `rows.Next()` → `rows.Err()`;
 the rows already delivered stay valid.

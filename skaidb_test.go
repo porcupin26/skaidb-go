@@ -697,3 +697,66 @@ func TestStreamRefusesMoreArgumentsThanTheWireCarries(t *testing.T) {
 		t.Fatalf("%d requests sent, valid = %v: want nothing sent and the connection usable", n, c.IsValid())
 	}
 }
+
+// ---- a value the driver cannot read -----------------------------------------
+
+// oneCell is the body of a Rows reply (without its tag): one column, one
+// row, and cell as that row's only value, byte for byte.
+func oneCell(cell []byte) []byte {
+	p := appendStr(binary.LittleEndian.AppendUint32(nil, 1), "v")
+	p = binary.LittleEndian.AppendUint32(p, 1) // rows
+	p = binary.LittleEndian.AppendUint32(p, 1) // cells
+	return append(binary.LittleEndian.AppendUint32(p, uint32(len(cell))), cell...)
+}
+
+// A cell whose value the driver cannot decode — a type tag it does not know,
+// from a server newer than it, or a value cut short — fails the statement.
+// Read as NULL, or as whatever the bytes that did arrive happen to spell, it
+// would be a wrong value with nothing to say so. Every shape a result set
+// arrives in is covered: one frame, the result sets of a CALL, a streamed
+// call answered in one frame, and the chunks of a stream.
+func TestAValueTheDriverCannotDecodeFailsTheStatement(t *testing.T) {
+	ctx := context.Background()
+	for _, bad := range []struct {
+		name, want string
+		cell       []byte
+	}{
+		{"a type tag the driver does not know", "skaidb: unknown value tag 11", []byte{11, 1, 2, 3}},
+		{"an integer cut short", "skaidb: truncated server message", []byte{2, 1, 2, 3}},
+		{"an unknown tag inside an array", "skaidb: unknown value tag 11", []byte{9, 1, 0, 0, 0, 11}},
+	} {
+		body := oneCell(bad.cell)
+		for _, shape := range []struct {
+			name   string
+			ctx    context.Context
+			frames [][]byte
+			// streamed: the value arrives after the query returned, and what
+			// is left of the stream is not the driver's to read any more.
+			streamed bool
+		}{
+			{"one frame", ctx, [][]byte{serverFrame(append([]byte{0}, body...))}, false},
+			{"result sets", ctx, [][]byte{serverFrame(append(binary.LittleEndian.AppendUint32([]byte{8}, 1), body...))}, false},
+			{"a streamed call answered in one frame", WithStreaming(ctx), [][]byte{serverFrame(append([]byte{0}, body...))}, false},
+			{"a chunk of a stream", WithStreaming(ctx), [][]byte{headerFrame("v"),
+				serverFrame(append([]byte{6}, body[len(body)-len(bad.cell)-12:]...)), endFrame()}, true},
+		} {
+			t.Run(bad.name+", "+shape.name, func(t *testing.T) {
+				c, _ := recordingServer(t, func([]byte) [][]byte { return shape.frames })
+				rs, err := c.QueryContext(shape.ctx, "SELECT v FROM t", nil)
+				if err == nil {
+					dest := make([]driver.Value, 1)
+					if err = rs.Next(dest); err == nil {
+						t.Fatalf("the value was read as %#v", dest[0])
+					}
+					rs.Close()
+				}
+				if err.Error() != bad.want {
+					t.Fatalf("err = %v, want %q", err, bad.want)
+				}
+				if c.IsValid() == shape.streamed {
+					t.Errorf("connection valid = %v: a whole frame leaves it in step, a stream cut short does not", c.IsValid())
+				}
+			})
+		}
+	}
+}

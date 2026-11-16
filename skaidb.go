@@ -1576,7 +1576,7 @@ func (c *conn) readRowsBody(r *reader) (driver.Rows, error) {
 		ncells := int(r.u32())
 		row := make([]driver.Value, ncells)
 		for j := 0; j < ncells; j++ {
-			row[j] = decodeValue(&reader{buf: r.blob()})
+			row[j] = r.cell()
 		}
 		data[i] = row
 	}
@@ -1600,7 +1600,7 @@ func (c *conn) readRows(r *reader) (driver.Rows, error) {
 			ncells := int(r.u32())
 			row := make([]driver.Value, ncells)
 			for j := 0; j < ncells; j++ {
-				row[j] = decodeValue(&reader{buf: r.blob()})
+				row[j] = r.cell()
 			}
 			data[i] = row
 		}
@@ -1623,7 +1623,7 @@ func (c *conn) readRows(r *reader) (driver.Rows, error) {
 				ncells := int(r.u32())
 				row := make([]driver.Value, ncells)
 				for j := 0; j < ncells; j++ {
-					row[j] = decodeValue(&reader{buf: r.blob()})
+					row[j] = r.cell()
 				}
 				data[i] = row
 			}
@@ -1888,7 +1888,7 @@ func (r *rows) fill() error {
 				ncells := int(rd.u32())
 				row := make([]driver.Value, ncells)
 				for j := 0; j < ncells; j++ {
-					row[j] = decodeValue(&reader{buf: rd.blob()})
+					row[j] = rd.cell()
 				}
 				data[i] = row
 			}
@@ -2132,6 +2132,19 @@ func (r *reader) blob() []byte {
 	return r.take(n)
 }
 func (r *reader) text() string { return string(r.blob()) }
+
+// cell reads one cell of a row: a value behind its length. A value that
+// cannot be decoded — a type tag the driver does not know, a value cut short
+// — is the message's error, like a message cut short itself: it is not read
+// as NULL, or as whatever the bytes that did arrive spell.
+func (r *reader) cell() driver.Value {
+	c := &reader{buf: r.blob()}
+	v := decodeValue(c)
+	if c.err != nil && r.err == nil {
+		r.err = c.err
+	}
+	return v
+}
 
 // ---- parameter binding (§5) ------------------------------------------------
 
