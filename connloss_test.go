@@ -1117,3 +1117,32 @@ func TestTransactionDoesNotWaitForRowsItsFunctionLeftOpen(t *testing.T) {
 	}
 	l.wantReceived([]string{"BEGIN", list, updateSQL, "COMMIT", "DELETE FROM audit"})
 }
+
+// A COMMIT that cannot be written is the same case whether or not the
+// function left rows open: it never left, the transaction was not
+// committed, and Transaction says so with the one error for it.
+func TestACommitThatCannotBeWrittenWithRowsOpenWasNotCommitted(t *testing.T) {
+	l, db := listServer(t)
+	ctx := context.Background()
+	left := make(chan *sql.Rows, 1)
+	err, returned := within(2*time.Second, func() error {
+		return Transaction(ctx, db, func(conn *sql.Conn) error {
+			rows, err := conn.QueryContext(ctx, list)
+			if err != nil {
+				return err
+			}
+			rows.Next()
+			left <- rows
+			l.kill(0)
+			return nil
+		})
+	})
+	defer (<-left).Close()
+	if !returned {
+		t.Fatal("Transaction did not return")
+	}
+	if !errors.Is(err, driver.ErrBadConn) || !strings.Contains(err.Error(), "before COMMIT was sent") {
+		t.Fatalf("err = %v, want the lost connection reported, COMMIT not sent", err)
+	}
+	l.wantReceived([]string{"BEGIN", list})
+}

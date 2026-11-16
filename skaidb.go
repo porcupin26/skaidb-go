@@ -541,12 +541,18 @@ func (c *conn) transportErr(err error, sent bool) error {
 			// statement per row. It would buy nothing here either: only a
 			// pinned connection runs a statement with a result set open,
 			// and database/sql does not retry on those.
-			return fmt.Errorf("skaidb: connection lost before the statement was sent: %w", err)
+			return fmt.Errorf("%w: %w", errNotSent, err)
 		}
 		return driver.ErrBadConn
 	}
 	return fmt.Errorf("skaidb: connection lost mid-statement (statement may or may not have applied): %w", err)
 }
+
+// errNotSent is driver.ErrBadConn's stand-in while a result set is open on
+// the connection (transportErr): the same fact — the connection is gone and
+// the statement never left — without the meaning database/sql gives the
+// other.
+var errNotSent = errors.New("skaidb: connection lost before the statement was sent")
 
 // retire takes the connection out of use for good: it is marked broken, so
 // database/sql discards it (IsValid), and its socket is closed there and

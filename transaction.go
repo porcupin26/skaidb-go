@@ -277,7 +277,7 @@ func runTransaction(ctx context.Context, begin func() (*sql.Conn, error), body f
 		// A COMMIT that fails has ended the transaction, whatever the reason,
 		// so no ROLLBACK follows it.
 		_, err = c.ExecContext(ctx, "COMMIT")
-		if errors.Is(err, driver.ErrBadConn) {
+		if errors.Is(err, driver.ErrBadConn) || errors.Is(err, errNotSent) {
 			// The COMMIT itself could not be written.
 			return errNotCommitted
 		}
