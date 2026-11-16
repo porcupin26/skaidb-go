@@ -653,7 +653,13 @@ statement, at once and on the same connection, up to three runs in all.
   capture, as `left` above; after a retry it holds what the last run set.
   Close every `*sql.Rows` before returning.
 - **If the opening statement fails**, its error is returned, the function
-  does not run and nothing else is sent.
+  does not run and nothing else is sent. A pooled connection that turns out
+  to be dead — the server restarted while it sat idle — is not such a
+  failure: nothing is open yet, so `Transaction` opens on another
+  connection, as `database/sql` does for a statement run through the
+  `*sql.DB`. Once the opening statement has been answered the transaction
+  stays on its connection; `TransactionConn` never leaves the one it was
+  given.
 - **If the function returns an error**, `ROLLBACK` is sent and that error
   is returned as it is, whatever the server answers to the `ROLLBACK`. The
   transaction is not run again, even when the error is a conflict. A

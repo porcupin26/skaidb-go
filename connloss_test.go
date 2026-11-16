@@ -14,6 +14,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -133,6 +134,30 @@ func (l *lossy) serve(n int, s net.Conn) {
 	}
 }
 
+// mortal is a client socket that can be made to die: from then on every
+// write fails before a byte leaves, as on a socket whose peer is long gone.
+type mortal struct {
+	net.Conn
+	left atomic.Int64 // writes it still carries; negative: no limit
+}
+
+func (m *mortal) Write(p []byte) (int, error) {
+	if m.left.Load() == 0 {
+		return 0, &net.OpError{Op: "write", Net: "tcp", Err: errors.New("broken pipe")}
+	}
+	m.left.Add(-1)
+	return m.Conn.Write(p)
+}
+
+// kill makes connection n dead, as an idle connection is once its server
+// has restarted: nobody knows until the next write.
+func (l *lossy) kill(n int) { l.client(n).nc.(*mortal).left.Store(0) }
+
+// killAfter lets connection n send that many more requests, then kills it.
+func (l *lossy) killAfter(n, requests int) {
+	l.client(n).nc.(*mortal).left.Store(2 * int64(requests)) // a request is two writes
+}
+
 // Connect implements driver.Connector: a new connection to the fake server,
 // past the handshake.
 func (l *lossy) Connect(context.Context) (driver.Conn, error) {
@@ -141,7 +166,9 @@ func (l *lossy) Connect(context.Context) (driver.Conn, error) {
 		return nil, err
 	}
 	<-l.accepted
-	c := &conn{nc: nc, consistency: consistencyQuorum, stmtLevel: consistencyQuorum,
+	m := &mortal{Conn: nc}
+	m.left.Store(-1)
+	c := &conn{nc: m, consistency: consistencyQuorum, stmtLevel: consistencyQuorum,
 		prepared: map[string]preparedStmt{}}
 	l.mu.Lock()
 	l.clients = append(l.clients, c)
@@ -363,4 +390,209 @@ func TestARetiredConnectionClosesItsSocket(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---- the opening statement on a dead pooled connection ----------------------
+
+// idle leaves n connections idle in db's pool, each having run a statement.
+func idle(t *testing.T, db *sql.DB, n int) {
+	t.Helper()
+	db.SetMaxIdleConns(n)
+	ctx := context.Background()
+	conns := make([]*sql.Conn, n)
+	for i := range conns {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.ExecContext(ctx, "DELETE FROM warm"); err != nil {
+			t.Fatal(err)
+		}
+		conns[i] = c
+	}
+	for _, c := range conns {
+		c.Close()
+	}
+	if got := db.Stats().Idle; got != n {
+		t.Fatalf("%d connections idle, want %d", got, n)
+	}
+}
+
+// The server restarted while the pool's connection sat idle: the socket is
+// dead and nobody knows. database/sql runs an ordinary statement on another
+// connection when the first write fails; a pinned *sql.Conn gets no such
+// retry, so the opening statement would come back as "driver: bad
+// connection". Nothing is open yet — the transaction opens on a fresh
+// connection and runs there.
+func TestTransactionOpensOnAnotherConnectionWhenThePooledOneIsDead(t *testing.T) {
+	l, db := lossyServer(t, nil)
+	ctx := context.Background()
+	runs := 0
+	if err := Transaction(ctx, db, update(ctx, &runs)); err != nil {
+		t.Fatalf("the first Transaction: %v", err)
+	}
+	l.kill(0)
+	if err := Transaction(ctx, db, update(ctx, &runs)); err != nil {
+		t.Fatalf("Transaction on a pool whose idle connection is dead: %v", err)
+	}
+	if runs != 2 {
+		t.Errorf("the function ran %d times, want once per transaction", runs)
+	}
+	l.wantReceived(
+		[]string{"BEGIN", updateSQL, "COMMIT"},
+		[]string{"BEGIN", updateSQL, "COMMIT"})
+	if s := db.Stats(); s.OpenConnections != 1 || s.InUse != 0 {
+		t.Errorf("pool: %d open, %d in use; want the new connection, idle", s.OpenConnections, s.InUse)
+	}
+}
+
+// However many idle connections died with the server: database/sql ends an
+// ordinary statement's retries on a new connection, so it succeeds whatever
+// the pool holds, and the opening statement does the same.
+func TestTransactionOpensWhateverTheNumberOfDeadConnections(t *testing.T) {
+	const dead = 5
+	ctx := context.Background()
+	for name, run := range map[string]func(db *sql.DB) error{
+		"an ordinary statement": func(db *sql.DB) error {
+			_, err := db.ExecContext(ctx, updateSQL)
+			return err
+		},
+		"Transaction": func(db *sql.DB) error {
+			runs := 0
+			return Transaction(ctx, db, update(ctx, &runs))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l, db := lossyServer(t, nil)
+			idle(t, db, dead)
+			for i := 0; i < dead; i++ {
+				l.kill(i)
+			}
+			if err := run(db); err != nil {
+				t.Fatalf("with %d dead connections in the pool: %v", dead, err)
+			}
+			if got := l.received(l.dials() - 1); got[len(got)-1] != updateSQL && got[len(got)-1] != "COMMIT" {
+				t.Errorf("the last connection dialled received %q, want the statement", got)
+			}
+		})
+	}
+}
+
+// deadOnArrival is a lossy server's connector whose connections are dead
+// from the start.
+type deadOnArrival struct{ *lossy }
+
+func (d deadOnArrival) Connect(ctx context.Context) (driver.Conn, error) {
+	c, err := d.lossy.Connect(ctx)
+	if err == nil {
+		c.(*conn).nc.(*mortal).left.Store(0)
+	}
+	return c, err
+}
+
+// The search for a live connection ends. When every connection is dead on
+// arrival, the opening statement gives up after as many as database/sql
+// dials for an ordinary statement, with the same error.
+func TestTransactionGivesUpWhenEveryConnectionIsDead(t *testing.T) {
+	ctx := context.Background()
+	tries := map[string]int{}
+	for name, run := range map[string]func(db *sql.DB) error{
+		"an ordinary statement": func(db *sql.DB) error {
+			_, err := db.ExecContext(ctx, updateSQL)
+			return err
+		},
+		"Transaction": func(db *sql.DB) error {
+			runs := 0
+			return Transaction(ctx, db, update(ctx, &runs))
+		},
+	} {
+		l, _ := lossyServer(t, nil)
+		db := sql.OpenDB(deadOnArrival{l})
+		defer db.Close()
+		if err := run(db); !errors.Is(err, driver.ErrBadConn) {
+			t.Fatalf("%s: err = %v, want driver.ErrBadConn", name, err)
+		}
+		tries[name] = l.dials()
+	}
+	if tries["Transaction"] != tries["an ordinary statement"] {
+		t.Errorf("Transaction dialled %d connections, an ordinary statement %d", tries["Transaction"], tries["an ordinary statement"])
+	}
+}
+
+// A run after a conflict opens on the connection the refused COMMIT came
+// back on — unless that one died in between, and then on another: the
+// refused COMMIT ended the transaction, so nothing is open here either.
+func TestTransactionOpensElsewhereWhenItsConnectionDiesBetweenRuns(t *testing.T) {
+	l, db := lossyServer(t, func(conn int, sql string) []byte {
+		if conn == 0 && sql == "COMMIT" {
+			return errorFrame(conflictMsg)
+		}
+		return nil
+	})
+	ctx := context.Background()
+	runs := 0
+	err := Transaction(ctx, db, func(conn *sql.Conn) error {
+		if runs == 0 {
+			l.killAfter(0, 2) // this run's statement and its COMMIT, no more
+		}
+		return update(ctx, &runs)(conn)
+	})
+	if err != nil {
+		t.Fatalf("Transaction: %v", err)
+	}
+	if runs != 2 {
+		t.Errorf("the function ran %d times, want 2", runs)
+	}
+	l.wantReceived(
+		[]string{"BEGIN", updateSQL, "COMMIT"},
+		[]string{"BEGIN", updateSQL, "COMMIT"})
+}
+
+// Only the opening statement moves. Once it has been answered the
+// transaction is on its connection for good: a statement of the function
+// that finds the connection dead is not sent on another one — it would
+// commit there on its own — and the transaction is not started over.
+func TestTransactionStaysOnItsConnectionOnceItIsOpen(t *testing.T) {
+	l, db := lossyServer(t, nil)
+	ctx := context.Background()
+	runs := 0
+	err := Transaction(ctx, db, func(conn *sql.Conn) error {
+		l.kill(0)
+		return update(ctx, &runs)(conn)
+	})
+	if !errors.Is(err, driver.ErrBadConn) {
+		t.Fatalf("err = %v, want the statement's driver.ErrBadConn", err)
+	}
+	if runs != 1 {
+		t.Errorf("the function ran %d times, want 1", runs)
+	}
+	l.wantReceived([]string{"BEGIN"})
+	// The pool is as it is after any lost connection: the next statement
+	// dials.
+	if _, err := db.ExecContext(ctx, "DELETE FROM audit"); err != nil {
+		t.Fatalf("the pool after the lost transaction: %v", err)
+	}
+	l.wantReceived([]string{"BEGIN"}, []string{"DELETE FROM audit"})
+}
+
+// TransactionConn has the caller's connection and no other: on a dead one
+// its opening statement fails as any statement on that *sql.Conn does.
+func TestTransactionConnDoesNotLeaveTheCallersConnection(t *testing.T) {
+	l, db := lossyServer(t, nil)
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, `USE "app"`); err != nil {
+		t.Fatal(err)
+	}
+	l.kill(0)
+	runs := 0
+	err = TransactionConn(ctx, conn, update(ctx, &runs))
+	if !errors.Is(err, driver.ErrBadConn) || runs != 0 {
+		t.Fatalf("err = %v after %d runs; want driver.ErrBadConn and no run", err, runs)
+	}
+	l.wantReceived([]string{`USE "app"`})
 }

@@ -3,6 +3,7 @@ package skaidb
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
@@ -104,7 +105,12 @@ func newTxConfig(opts []TxOption) (txConfig, error) {
 //
 //   - The opening statement: "BEGIN", or TxBegin's. If it fails, its error
 //     is returned, body does not run and nothing else is sent — without a
-//     transaction each statement of body would commit on its own.
+//     transaction each statement of body would commit on its own. A pooled
+//     connection that turns out to be dead — the server restarted while it
+//     sat idle — is not such a failure: nothing is open yet, so the
+//     statement is sent on another connection, as database/sql does for a
+//     statement run through the *sql.DB. Once it has been answered the
+//     transaction stays on its connection, whatever happens to it.
 //   - body's statements. If body returns an error, ROLLBACK is sent and
 //     body's error is returned as it is, whatever the server answered to the
 //     ROLLBACK. The transaction is not run again, even when body's error is
@@ -129,29 +135,101 @@ func Transaction(ctx context.Context, db *sql.DB, body func(conn *sql.Conn) erro
 	if err != nil {
 		return err
 	}
-	c, err := db.Conn(ctx)
-	if err != nil {
-		return err
+	var c *sql.Conn
+	defer func() {
+		if c != nil {
+			c.Close()
+		}
+	}()
+	return runTransaction(ctx, func() (*sql.Conn, error) {
+		if c != nil {
+			// A run after a conflict: on the same connection, unless that
+			// one has died since the refused COMMIT.
+			_, err := c.ExecContext(ctx, cfg.begin)
+			if !errors.Is(err, driver.ErrBadConn) {
+				return c, err
+			}
+			c.Close()
+		}
+		var err error
+		c, err = beginPooled(ctx, db, cfg.begin)
+		return c, err
+	}, body, cfg)
+}
+
+// beginPooled takes a connection from the pool and opens the transaction on
+// it, moving to another connection when the one it got is dead.
+//
+// Nothing has been answered at that point, so nothing is lost by opening the
+// transaction elsewhere. That ends with the opening statement: a transaction
+// is its connection's, and no later statement of it is sent on another one.
+func beginPooled(ctx context.Context, db *sql.DB, begin string) (*sql.Conn, error) {
+	var retry badConnRetry
+	for {
+		c, err := db.Conn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = c.ExecContext(ctx, begin); err == nil {
+			return c, nil
+		}
+		c.Close()
+		if !retry.again(db, err) {
+			return nil, err
+		}
 	}
-	defer c.Close()
-	return runTransaction(ctx, c, body, cfg)
+}
+
+// badConnRetry bounds the tries of a call that takes its own connection from
+// the pool and finds it dead before anything reached the server
+// (driver.ErrBadConn).
+//
+// database/sql answers that, for the statements it runs itself, with two
+// tries on pooled connections and a last one on a new connection. A pinned
+// *sql.Conn gets no retry at all, and the pool cannot be asked for a new
+// connection. But each dead connection found is closed and gone from the
+// pool, so the search ends by itself: after the first failure it may go on
+// for as many tries as the pool has idle connections — when the server
+// restarted, each is as dead as the first — and two more.
+type badConnRetry struct{ tries, limit int }
+
+// again reports whether the call that failed with err is to be tried on
+// another connection.
+func (r *badConnRetry) again(db *sql.DB, err error) bool {
+	if !errors.Is(err, driver.ErrBadConn) {
+		return false
+	}
+	if r.tries == 0 {
+		r.limit = db.Stats().Idle + 2
+	}
+	r.tries++
+	return r.tries <= r.limit
 }
 
 // TransactionConn is Transaction on a connection the caller has pinned with
 // db.Conn — for a transaction that must share the connection's session state
 // (USE) or follow other statements on the same socket. The connection stays
-// the caller's: it is not closed.
+// the caller's: it is not closed, and the transaction never leaves it — on
+// a dead connection the opening statement fails with driver.ErrBadConn, as
+// any statement on that *sql.Conn does.
 func TransactionConn(ctx context.Context, c *sql.Conn, body func(conn *sql.Conn) error, opts ...TxOption) error {
 	cfg, err := newTxConfig(opts)
 	if err != nil {
 		return err
 	}
-	return runTransaction(ctx, c, body, cfg)
+	return runTransaction(ctx, func() (*sql.Conn, error) {
+		_, err := c.ExecContext(ctx, cfg.begin)
+		return c, err
+	}, body, cfg)
 }
 
-func runTransaction(ctx context.Context, c *sql.Conn, body func(*sql.Conn) error, cfg txConfig) error {
+// runTransaction runs the transaction until it commits or fails. begin
+// sends the opening statement of a run and returns the connection that
+// answered it: the transaction's, until its COMMIT or ROLLBACK.
+func runTransaction(ctx context.Context, begin func() (*sql.Conn, error), body func(*sql.Conn) error, cfg txConfig) error {
 	for attempt := 1; ; attempt++ {
-		if _, err := c.ExecContext(ctx, cfg.begin); err != nil {
+		c, err := begin()
+		if err != nil {
 			return err
 		}
 		if err := runBody(ctx, c, body); err != nil {
@@ -159,7 +237,7 @@ func runTransaction(ctx context.Context, c *sql.Conn, body func(*sql.Conn) error
 		}
 		// A COMMIT that fails has ended the transaction, whatever the reason,
 		// so no ROLLBACK follows it.
-		_, err := c.ExecContext(ctx, "COMMIT")
+		_, err = c.ExecContext(ctx, "COMMIT")
 		if err == nil || attempt >= cfg.attempts || !errors.Is(err, ErrTransactionConflict) {
 			return err
 		}
