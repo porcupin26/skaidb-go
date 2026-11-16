@@ -163,12 +163,147 @@ func TestAConnectionWhoseSettingsCannotBeClearedIsDropped(t *testing.T) {
 	}
 }
 
+// A transaction lives on its connection, and one a borrower left open must
+// not reach the next borrower: that one's statements would run inside it,
+// seen by nobody else and never committed. A connection that comes back
+// with a transaction open is closed — the server drops a transaction with
+// its connection, at once — and the next borrower gets another. That is
+// what becomes of a BEGIN sent through the *sql.DB, and of a *sql.Conn
+// closed between its BEGIN and its COMMIT.
+func TestATransactionLeftOpenDoesNotReachTheNextBorrower(t *testing.T) {
+	ctx := context.Background()
+	for name, borrow := range map[string]func(t *testing.T, db *sql.DB) []string{
+		"a BEGIN through the *sql.DB": func(t *testing.T, db *sql.DB) []string {
+			exec1(t, db, "BEGIN")
+			return []string{"BEGIN"}
+		},
+		"a *sql.Conn closed before its COMMIT": func(t *testing.T, db *sql.DB) []string {
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			exec1(t, conn, "begin transaction;", updateSQL)
+			return []string{"begin transaction;", updateSQL}
+		},
+		"a transaction a failed statement did not end": func(t *testing.T, db *sql.DB) []string {
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			exec1(t, conn, "BEGIN ATOMIC PARTITION (tenant = 'acme') -- one shard")
+			const failing = "UPDATE accounts SET balance = 1/0 -- refused"
+			if _, err := conn.ExecContext(ctx, failing); err == nil {
+				t.Fatal("the failing statement succeeded")
+			}
+			return []string{"BEGIN ATOMIC PARTITION (tenant = 'acme') -- one shard", failing}
+		},
+		"a COMMIT the server could not read": func(t *testing.T, db *sql.DB) []string {
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			exec1(t, conn, "BEGIN")
+			// Not a COMMIT to the server (a parse error): the transaction is
+			// still open.
+			const work = "COMMIT WORK -- refused"
+			if _, err := conn.ExecContext(ctx, work); err == nil {
+				t.Fatal("COMMIT WORK succeeded")
+			}
+			return []string{"BEGIN", work}
+		},
+		"a second BEGIN the server refused": func(t *testing.T, db *sql.DB) []string {
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			exec1(t, conn, "BEGIN")
+			_, _ = conn.ExecContext(ctx, "BEGIN -- refused")
+			return []string{"BEGIN", "BEGIN -- refused"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := fakeMembers(t, "a")[0]
+			db := memberDB(t, m, "")
+			db.SetMaxOpenConns(1)
+			sent := borrow(t, db)
+			exec1(t, db, addNote)
+			if m.ranIn(t, addNote).transaction {
+				t.Error("the next borrower's statement ran inside the transaction left open")
+			}
+			wantMemberReceived(t, m, sent, []string{addNote})
+			if s := db.Stats(); s.OpenConnections != 1 {
+				t.Errorf("%d connections open, want the new one alone", s.OpenConnections)
+			}
+		})
+	}
+}
+
+// A transaction that was ended — committed, rolled back, or refused at its
+// COMMIT, which ends it too — leaves its connection as the pool hands it
+// out: it is used again, and nothing is sent to put it back. So does a
+// transaction that was never opened, and so does Transaction, whose
+// statements are noted like any other.
+func TestAnEndedTransactionLeavesItsConnectionInThePool(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name       string
+		statements []string
+		conflict   bool // the member refuses COMMIT with a conflict
+	}{
+		{"committed", []string{"BEGIN", updateSQL, "COMMIT"}, false},
+		{"rolled back", []string{"BEGIN", updateSQL, "ROLLBACK"}, false},
+		{"other spellings", []string{"begin transaction", updateSQL, " Commit\tTransaction ; -- done"}, false},
+		{"rolled back, with a comment", []string{"BEGIN", updateSQL, "rollback -- not this time"}, false},
+		{"refused at COMMIT", []string{"BEGIN", updateSQL, "COMMIT"}, true},
+		{"never opened", []string{"BEGIN -- refused", updateSQL}, false},
+		{"a ROLLBACK with nothing open", []string{"ROLLBACK"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := fakeMembers(t, "a")[0]
+			m.conflict.Store(tc.conflict)
+			db := memberDB(t, m, "")
+			conn, err := db.Conn(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, s := range tc.statements {
+				_, _ = conn.ExecContext(ctx, s)
+			}
+			conn.Close()
+			m.conflict.Store(false)
+			exec1(t, db, addNote)
+			if m.ranIn(t, addNote).transaction {
+				t.Error("the next statement ran inside a transaction")
+			}
+			wantMemberReceived(t, m, append(append([]string{}, tc.statements...), addNote))
+		})
+	}
+	t.Run("Transaction", func(t *testing.T) {
+		m := fakeMembers(t, "a")[0]
+		db := memberDB(t, m, "")
+		runs := 0
+		for i := 0; i < 2; i++ {
+			if err := Transaction(ctx, db, update(ctx, &runs)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		exec1(t, db, addNote)
+		wantMemberReceived(t, m, []string{"BEGIN", updateSQL, "COMMIT", "BEGIN", updateSQL, "COMMIT", addNote})
+	})
+}
+
 // What the driver reads as a session statement, besides USE: a text that is
 // one statement whose first words are SET CONSISTENCY or SET SCAN BUDGET —
 // with DEFAULT behind them it clears the setting, with anything else it
-// sets one. Words are apart by whatever the server takes for whitespace,
-// `--` comments are skipped, and the words that are names to the server may
-// be written in double quotes. Anything else is left alone.
+// sets one; a statement whose first word is BEGIN, which opens a
+// transaction; and exactly COMMIT [TRANSACTION] or ROLLBACK [TRANSACTION],
+// which ends one. Words are apart by whatever the server takes for
+// whitespace, `--` comments are skipped, and the words that are names to
+// the server may be written in double quotes. Anything else is left alone.
 func TestSessionStatement(t *testing.T) {
 	for sql, want := range map[string]sessionKind{
 		"SET CONSISTENCY ALL":                    consistencySet,
@@ -196,6 +331,37 @@ func TestSessionStatement(t *testing.T) {
 		"set scan budget default ;":              scanBudgetCleared,
 		`SET SCAN BUDGET "DEFAULT"`:              scanBudgetCleared,
 		"SET SCAN BUDGET DEFAULT -- back":        scanBudgetCleared,
+		"BEGIN":                                  transactionBegin,
+		"begin;":                                 transactionBegin,
+		"BEGIN TRANSACTION":                      transactionBegin,
+		"BEGIN ATOMIC":                           transactionBegin,
+		"BEGIN ATOMIC PARTITION (tenant = 'a')":  transactionBegin,
+		"BEGIN -- the transfer":                  transactionBegin,
+		"-- the transfer\n  BEGIN":               transactionBegin,
+		"BEGIN\u00a0TRANSACTION":                 transactionBegin,
+		"COMMIT":                                 transactionCommit,
+		"commit;":                                transactionCommit,
+		"COMMIT TRANSACTION":                     transactionCommit,
+		" Commit\tTransaction ; -- done":         transactionCommit,
+		"COMMIT -- all of it\n;":                 transactionCommit,
+		"ROLLBACK":                               transactionRollback,
+		"rollback transaction;":                  transactionRollback,
+		"ROLLBACK -- not this time":              transactionRollback,
+		"COMMIT WORK":                            otherStatement,
+		"COMMIT;;":                               otherStatement,
+		"COMMIT; BEGIN":                          otherStatement,
+		"COMMIT TRANSACTION now":                 otherStatement,
+		`COMMIT "TRANSACTION"`:                   otherStatement,
+		"ROLLBACK TO savepoint":                  otherStatement,
+		"ROLLBACK TRANSACTION TRANSACTION":       otherStatement,
+		`"BEGIN"`:                                otherStatement,
+		`"COMMIT"`:                               otherStatement,
+		"BEGINS":                                 otherStatement,
+		"COMMITTED":                              otherStatement,
+		"END":                                    otherStatement,
+		"START TRANSACTION":                      otherStatement,
+		"EXPLAIN COMMIT":                         otherStatement,
+		"CREATE TABLE begin (PRIMARY KEY (id))":  otherStatement,
 		"USE app":                                useDatabase,
 		`USE DATABASE "app";`:                    useDatabase,
 		"SET":                                    otherStatement,

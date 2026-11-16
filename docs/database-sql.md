@@ -145,6 +145,15 @@ on a `*sql.Conn` you hold. See
 [Transactions](../README.md#transactions) in the README. Outside a
 transaction every statement commits on its own.
 
+A transaction is its connection's, so `BEGIN` is for a `*sql.Conn` (or the
+helpers), not for `db.Exec`: through the `*sql.DB` each statement is a
+borrow of its own. The driver notes a transaction a statement opened — its
+first word is `BEGIN` — until a `COMMIT [TRANSACTION]` or
+`ROLLBACK [TRANSACTION]` is answered, and a connection that goes back to
+the pool with one still open is closed instead of pooled: the server drops
+the transaction with it, and the next borrower gets a connection with
+nothing open.
+
 ## `Ping`
 
 Checks out a connection, dialling one if the pool is empty. There is no

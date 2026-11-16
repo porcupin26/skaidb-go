@@ -705,7 +705,12 @@ the pool and nothing counts against its member.
 **By hand.** The same statements work without the helper, on a `*sql.Conn`.
 Two rules: keep the whole transaction on that one connection, and stop if
 the opening statement fails — the statements after it would each commit on
-their own.
+their own. Through the `*sql.DB` every statement is a borrow of its own, so
+a `BEGIN` sent that way opens nothing for the statements behind it: a
+connection that comes back to the pool with a transaction open — that
+`BEGIN`'s, or a `*sql.Conn` closed between its `BEGIN` and its `COMMIT` —
+is closed, which ends the transaction on the server, and is never handed
+to the next borrower.
 
 ```go
 conn, err := db.Conn(ctx) // one connection for the whole transaction
@@ -901,7 +906,10 @@ apply (`SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime`,
 - the default consistency (from the DSN; `WithConsistency` is per
   statement);
 - an open [transaction](#transactions), which is why `Transaction` keeps
-  one connection for all of it.
+  one connection for all of it. The driver notes a transaction a statement
+  opened (its first word is `BEGIN`) until a `COMMIT` or `ROLLBACK` is
+  answered; a connection that goes back to the pool with one still open is
+  closed, so no borrower starts inside another's transaction.
 
 Each pooled connection is a single socket that serialises one request /
 one response; concurrency comes from the pool, not from pipelining. A

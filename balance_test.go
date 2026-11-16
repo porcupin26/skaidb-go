@@ -253,6 +253,7 @@ func (m *fakeMember) serve(conn int, s net.Conn) {
 			resp = fakeRowsFrame([]string{"name"}, nil)
 		case text == "COMMIT" && m.conflict.Load():
 			resp = appendStr([]byte{3}, conflictMsg)
+			session.transaction = false // a refused COMMIT has ended it
 		case strings.HasPrefix(text, "SELECT"):
 			time.Sleep(time.Duration(m.delay.Load()))
 			resp = fakeRowsFrame([]string{"member"}, [][]any{{m.name}})

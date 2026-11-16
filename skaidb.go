@@ -381,6 +381,11 @@ type conn struct {
 	// SCAN BUDGET. A pool's connection has neither, so ResetSession clears
 	// them before the next borrower gets it.
 	consistencyOverride, scanBudget bool
+	// A transaction is open on the session, as far as the driver can tell: a
+	// statement that begins with BEGIN was accepted and no COMMIT or
+	// ROLLBACK has been answered since (see note). The pool has no use for
+	// such a connection: IsValid.
+	inTx bool
 	// Result sets handed to database/sql and not closed yet. While there is
 	// one, the connection is pinned — a *sql.Conn whose owner is still
 	// reading rows, or has left them open — and database/sql cannot close
@@ -394,8 +399,14 @@ type conn struct {
 // whose member the Connector has ejected, seen not ready or dropped. The
 // replacement is dialled through the Connector, which walks the members —
 // that is where failover and rebalancing happen.
+//
+// And so is a connection that comes back with a transaction open — a BEGIN
+// sent through the *sql.DB, a *sql.Conn closed between its BEGIN and its
+// COMMIT. Its next borrower's statements would run inside that transaction,
+// invisible to every other session and never committed; closing the
+// connection is what ends the transaction on the server, there and then.
 func (c *conn) IsValid() bool {
-	return !c.closed && !c.broken.Load() && (c.lb == nil || c.lb.keep(c))
+	return !c.closed && !c.broken.Load() && !c.inTx && (c.lb == nil || c.lb.keep(c))
 }
 
 // ResetSession implements driver.SessionResetter: database/sql calls it
@@ -474,12 +485,25 @@ func useSQL(name string) string {
 	return `USE "` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
-// note keeps track of the session: sqlText was answered with success, and if
-// it is a statement that changes the session — as far as the driver reads
-// them, see sessionStatement — the connection is no longer as the pool
-// hands it out, or is so again.
-func (c *conn) note(sqlText string) {
-	switch kind, database := sessionStatement(sqlText); kind {
+// note keeps track of the session: the server answered sqlText — with
+// success (ok), or with an error — and if it is a statement that changes
+// the session, as far as the driver reads them (sessionStatement), the
+// connection is no longer as the pool hands it out, or is so again.
+//
+// Only a statement the server accepted changes anything, with one
+// exception: a COMMIT or a ROLLBACK ends the transaction whatever the
+// answer. A COMMIT that is refused — as a conflict, say — has ended its
+// transaction too (PROTOCOL.md §6 rule 6).
+func (c *conn) note(sqlText string, ok bool) {
+	kind, database := sessionStatement(sqlText)
+	if kind == transactionCommit || kind == transactionRollback {
+		c.inTx = false
+		return
+	}
+	if !ok {
+		return
+	}
+	switch kind {
 	case useDatabase:
 		c.database = database
 	case consistencySet:
@@ -490,6 +514,8 @@ func (c *conn) note(sqlText string) {
 		c.scanBudget = true
 	case scanBudgetCleared:
 		c.scanBudget = false
+	case transactionBegin:
+		c.inTx = true
 	}
 }
 
@@ -497,22 +523,36 @@ func (c *conn) note(sqlText string) {
 type sessionKind uint8
 
 const (
-	otherStatement     sessionKind = iota // nothing the driver keeps track of
-	useDatabase                           // USE [DATABASE] <name>
-	consistencySet                        // SET CONSISTENCY ONE | QUORUM | ALL
-	consistencyCleared                    // SET CONSISTENCY DEFAULT
-	scanBudgetSet                         // SET SCAN BUDGET ROWS <n> … | BYTES <n> …
-	scanBudgetCleared                     // SET SCAN BUDGET DEFAULT
+	otherStatement      sessionKind = iota // nothing the driver keeps track of
+	useDatabase                            // USE [DATABASE] <name>
+	consistencySet                         // SET CONSISTENCY ONE | QUORUM | ALL
+	consistencyCleared                     // SET CONSISTENCY DEFAULT
+	scanBudgetSet                          // SET SCAN BUDGET ROWS <n> … | BYTES <n> …
+	scanBudgetCleared                      // SET SCAN BUDGET DEFAULT
+	transactionBegin                       // BEGIN …
+	transactionCommit                      // COMMIT [TRANSACTION]
+	transactionRollback                    // ROLLBACK [TRANSACTION]
 )
 
 // sessionStatement reads sqlText as one statement that changes its session:
-// a USE (and the database it names), or a statement whose first words are
-// SET CONSISTENCY or SET SCAN BUDGET — which clears the setting when the
-// next word is DEFAULT and sets one otherwise. The driver reads no further:
-// the server has accepted the statement, so it is one statement and well
-// formed. Words are read as the server's lexer reads them (skipBlank,
-// sqlWord), and the ones that are names to it — everything but SET — may be
-// written in double quotes. Anything else is otherStatement.
+//
+//   - a USE (and the database it names);
+//   - a statement whose first words are SET CONSISTENCY or SET SCAN BUDGET,
+//     which clears the setting when the next word is DEFAULT and sets one
+//     otherwise;
+//   - a statement whose first word is BEGIN — BEGIN, BEGIN TRANSACTION,
+//     BEGIN ATOMIC … — which opens a transaction;
+//   - exactly COMMIT [TRANSACTION] or ROLLBACK [TRANSACTION], behind one
+//     semicolon at most, which ends one.
+//
+// Of a SET and a BEGIN the driver reads no further than those words: once
+// the server has accepted the statement, it is one statement and well
+// formed. A COMMIT or a ROLLBACK counts when the server refuses it too, so
+// those are read to their end — `COMMIT WORK` is a parse error to the
+// server, and leaves the transaction open. Words are read as the server's
+// lexer reads them (skipBlank, sqlWord), and the ones that are names to it,
+// not keywords — CONSISTENCY, SCAN, BUDGET, DEFAULT — may be written in
+// double quotes. Anything else is otherStatement.
 func sessionStatement(sqlText string) (kind sessionKind, database string) {
 	// Every statement the server accepts comes through here; all but a
 	// handful leave at their first word.
@@ -526,6 +566,20 @@ func sessionStatement(sqlText string) (kind sessionKind, database string) {
 		if database, ok := parseUse(start); ok {
 			return useDatabase, database
 		}
+	case strings.EqualFold(first, "BEGIN"):
+		return transactionBegin, ""
+	case strings.EqualFold(first, "COMMIT"), strings.EqualFold(first, "ROLLBACK"):
+		rest = skipBlank(rest)
+		if word, after, ok := sqlWord(rest); ok && strings.EqualFold(word, "TRANSACTION") {
+			rest = skipBlank(after)
+		}
+		if skipBlank(strings.TrimPrefix(rest, ";")) != "" {
+			break
+		}
+		if first[0]|0x20 == 'c' {
+			return transactionCommit, ""
+		}
+		return transactionRollback, ""
 	case strings.EqualFold(first, "SET"):
 		word, rest := sqlName(rest)
 		switch {
@@ -1730,9 +1784,7 @@ func (c *conn) query(sqlText string) (driver.Rows, error) {
 		return nil, err
 	}
 	rs, err := c.readRows(r)
-	if err == nil {
-		c.note(sqlText)
-	}
+	c.note(sqlText, err == nil)
 	return rs, err
 }
 
@@ -1835,9 +1887,7 @@ func (c *conn) exec(sqlText string) (driver.Result, error) {
 		return nil, err
 	}
 	res, err := c.readResult(r)
-	if err == nil {
-		c.note(sqlText)
-	}
+	c.note(sqlText, err == nil)
 	return res, err
 }
 
@@ -1982,7 +2032,7 @@ func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Row
 		return c.readRows(&reader{buf: frame})
 	case 1, 2: // Mutation / Ddl through a streaming call
 		if len(args) == 0 {
-			c.note(sqlText)
+			c.note(sqlText, true)
 		}
 		return &rows{cols: []string{}, done: true}, nil
 	case 3:
@@ -1999,6 +2049,9 @@ func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Row
 		// a second time.
 		if len(args) > 0 && msg == unbindableKind {
 			return nil, fmt.Errorf("%w: %s", errUnpreparable, msg)
+		}
+		if len(args) == 0 {
+			c.note(sqlText, false)
 		}
 		return nil, serverError(msg)
 	}
