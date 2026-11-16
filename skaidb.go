@@ -44,6 +44,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 )
 
 func init() { sql.Register("skaidb", &drv{}) }
@@ -367,6 +368,12 @@ type conn struct {
 	// Set by the context watcher when the caller cancelled: the I/O error
 	// that follows is the caller's doing, not a member failure.
 	cancelled atomic.Bool
+	// The session database: home is the DSN's ("" when it names none),
+	// entered on every dial; database is where the session is as far as the
+	// driver can tell — home, until a USE the server accepted went by (see
+	// noteUse). ResetSession takes a connection that differs back to home
+	// before the pool hands it to its next borrower.
+	home, database string
 	// Result sets handed to database/sql and not closed yet. While there is
 	// one, the connection is pinned — a *sql.Conn whose owner is still
 	// reading rows, or has left them open — and database/sql cannot close
@@ -388,11 +395,96 @@ func (c *conn) IsValid() bool {
 // before reusing an idle connection, so one whose member left the rotation
 // while it sat idle is closed (driver.ErrBadConn) instead of handed out, and
 // the statement runs on another connection.
+//
+// It is also where a connection goes back to the DSN's database. A USE is
+// the session's: the borrower that sent one — on a *sql.Conn it held, or
+// through the *sql.DB — left this connection, and no other, in a database
+// the pool was not opened on, and the next borrower's statements would run
+// there. The DSN's database is entered again first; a connection that cannot
+// be taken back is closed rather than handed out. A DSN that names no
+// database gives nothing to go back to, and such a connection stays where
+// its last USE left it.
 func (c *conn) ResetSession(ctx context.Context) error {
 	if !c.IsValid() {
 		return driver.ErrBadConn
 	}
+	if c.home != "" && c.database != c.home {
+		finish := c.applyContext(ctx)
+		_, err := c.exec(useSQL(c.home))
+		if finish(err) != nil {
+			return driver.ErrBadConn
+		}
+	}
 	return nil
+}
+
+// useSQL is the statement that enters database name.
+func useSQL(name string) string {
+	return `USE "` + strings.ReplaceAll(name, `"`, `""`) + `"`
+}
+
+// noteUse keeps track of the session database: sqlText was answered with
+// success, and if it is a USE, the session is in the database it names.
+func (c *conn) noteUse(sqlText string) {
+	if name, ok := parseUse(sqlText); ok {
+		c.database = name
+	}
+}
+
+// parseUse reads sqlText as exactly one `USE [DATABASE] <name>` statement:
+// the name bare (letters, digits, underscores) or in double quotes with ""
+// for a quote inside, and an optional trailing semicolon. Anything else — a
+// comment, a second statement, a name it cannot read — is not a USE as far
+// as the driver is concerned.
+func parseUse(sqlText string) (name string, ok bool) {
+	const space = " \t\r\n"
+	s := strings.TrimRight(strings.TrimLeft(sqlText, space), space)
+	s = strings.TrimRight(strings.TrimSuffix(s, ";"), space)
+	// word cuts keyword off the front of s: a whole word, so followed by
+	// the end, a space or an opening quote.
+	word := func(s, keyword string) (string, bool) {
+		if len(s) < len(keyword) || !strings.EqualFold(s[:len(keyword)], keyword) {
+			return s, false
+		}
+		rest := s[len(keyword):]
+		if rest != "" && !strings.ContainsRune(space+`"`, rune(rest[0])) {
+			return s, false
+		}
+		return strings.TrimLeft(rest, space), true
+	}
+	s, ok = word(s, "USE")
+	if !ok {
+		return "", false
+	}
+	// DATABASE is the optional keyword only when a name follows it;
+	// alone, it is the name.
+	if rest, ok := word(s, "DATABASE"); ok && rest != "" {
+		s = rest
+	}
+	if !strings.HasPrefix(s, `"`) {
+		for _, r := range s {
+			if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
+				return "", false
+			}
+		}
+		return s, s != ""
+	}
+	var b strings.Builder
+	for i := 1; i < len(s); i++ {
+		switch {
+		case s[i] != '"':
+			b.WriteByte(s[i])
+		case i+1 < len(s) && s[i+1] == '"':
+			b.WriteByte('"')
+			i++
+		default: // the closing quote: the statement ends here, or it is not one
+			if i != len(s)-1 || b.Len() == 0 {
+				return "", false
+			}
+			return b.String(), true
+		}
+	}
+	return "", false
 }
 
 // roundTrip writes one request frame and reads the first frame of its
@@ -550,7 +642,8 @@ func dialOneDeadline(cfg config, addr string, deadline time.Time) (*conn, error)
 	// the ones database/sql makes to grow the pool, which is exactly why this
 	// belongs here and not in the caller.
 	if cfg.database != "" {
-		if _, err := c.exec(`USE "` + strings.ReplaceAll(cfg.database, `"`, `""`) + `"`); err != nil {
+		c.home = cfg.database
+		if _, err := c.exec(useSQL(cfg.database)); err != nil {
 			nc.Close()
 			if !c.broken.Load() {
 				// The server refused the database: the caller's problem,
@@ -1388,7 +1481,11 @@ func (c *conn) query(sqlText string) (driver.Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	return c.readRows(r)
+	rs, err := c.readRows(r)
+	if err == nil {
+		c.noteUse(sqlText)
+	}
+	return rs, err
 }
 
 // readRowsBody parses a Rows frame whose tag has already been consumed.
@@ -1480,7 +1577,11 @@ func (c *conn) exec(sqlText string) (driver.Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	return c.readResult(r)
+	res, err := c.readResult(r)
+	if err == nil {
+		c.noteUse(sqlText)
+	}
+	return res, err
 }
 
 func (c *conn) readResult(r *reader) (driver.Result, error) {
@@ -1622,6 +1723,9 @@ func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Row
 	case 8: // ResultSets — a CALL whose body EMITted, in one frame
 		return c.readRows(&reader{buf: frame})
 	case 1, 2: // Mutation / Ddl through a streaming call
+		if len(args) == 0 {
+			c.noteUse(sqlText)
+		}
 		return &rows{cols: []string{}, done: true}, nil
 	case 3:
 		msg := r.text()

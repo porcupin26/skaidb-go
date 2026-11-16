@@ -77,9 +77,28 @@ skaidb://app:s3cret@db1,db2,db3/orders?load_balancing=least_latency&discover=tru
 ## Session database
 
 A path selects the database: `skaidb://host/app` runs `USE "app"` on every
-new connection, including the ones the pool opens later. Without it,
-unqualified table names resolve in the server's default database; you can
-also qualify names (`app.users`) in the SQL.
+new connection, including the ones the pool opens later — to grow, or to
+replace a connection lost to a restarted member. Without it, unqualified
+table names resolve in the server's default database; you can also qualify
+names (`app.users`) in the SQL.
+
+The path is the way to select the pool's database. A `USE` statement is
+the session's — one connection's:
+
+- on a `*sql.Conn` it holds for as long as you keep that `*sql.Conn`. When
+  the connection goes back to the pool, the driver enters the DSN's
+  database again before the next borrower's first statement, so one
+  borrower's `USE` is never the next one's surprise. A connection that
+  cannot be taken back (the database was dropped, a transaction was left
+  open) is closed instead. A `*sql.Conn` whose connection is lost fails its
+  statements; none is run on another session.
+- through the `*sql.DB` (`db.Exec("USE app")`) it reaches whichever pooled
+  connection ran it and is undone the same way when the DSN names a
+  database. **When the DSN names none, there is nothing to go back to**:
+  the `USE` stays on that one connection, the pool's other connections are
+  not in `app`, and the connection that replaces it after a restart is not
+  either — statements then resolve against the default database, silently.
+  Put the database in the DSN.
 
 ## Consistency
 
