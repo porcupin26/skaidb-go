@@ -4,6 +4,85 @@ All notable changes to the skaidb Go driver. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/) and Go module conventions.
 
+## [1.4.1] — 2026-11-16
+
+### Fixed
+- **A context cancelled after its statement had returned could break the
+  connection.** `defer cancel()` does exactly that. The goroutine that
+  watches a statement's context was not waited for, and one that ran late
+  marked the healthy connection broken and left a dead deadline on its
+  socket: the next statement on a `*sql.Conn` failed with `driver: bad
+  connection`, and a pooled connection was thrown away — possibly after
+  `database/sql` had already handed it to the next caller. A statement now
+  returns only once its watcher is gone.
+- **A connection the driver gives up on closes its socket at once, and
+  takes no further statement.** After a transport failure, a statement cut
+  short by its deadline or a cancelled context, or an unexpected frame,
+  the socket stayed open until `database/sql` closed the connection — for
+  a `*sql.Conn`, whenever its owner did — so the server kept the session
+  and any transaction it had open. Worse, a `*sql.Conn` kept sending on
+  it: after a statement cut short by its deadline, the next statement read
+  that statement's late reply as its own, and `skaidb.Transaction` could
+  report a commit whose answer it never read. Statements on such a
+  connection now fail with `skaidb: connection is retired: …` and nothing
+  is written.
+- **`Transaction` after a server restart.** The first `Transaction` on
+  each connection left dead in the pool failed with `driver: bad
+  connection`, where `db.Exec` in the same state succeeds. Its opening
+  statement now moves to another connection when the one it took is dead,
+  as `database/sql` does for its own statements; nothing after the opening
+  statement is ever moved or retried. `ExecBatch` finds a live connection
+  the same way, however many idle connections the restart left dead (it
+  gave up after three).
+- **A statement with arguments after a server restart.** A transport
+  failure while the statement was being prepared came back as the raw
+  socket error (`write: broken pipe`, or a bare `EOF`) and the dead
+  connection went back to the pool, so every statement with arguments
+  whose text that connection had not prepared yet kept failing on it. The
+  statement is now run on another connection, and the dead one dropped.
+- **A transaction whose connection was lost.** When the function passed to
+  `Transaction` carried on past the error and returned `nil`,
+  `Transaction` returned `sql: connection is already closed`. It now
+  returns `skaidb: transaction not committed: …` (matches
+  `driver.ErrBadConn`): `COMMIT` was not sent and nothing was committed. A
+  connection lost under the `COMMIT` itself still reports that the outcome
+  is unknown.
+- **A transaction whose function left a streamed result open.** Neither
+  `COMMIT` nor `ROLLBACK` can be sent on a connection that is streaming,
+  so the transaction stayed open on the server; `Transaction` then waited
+  for the rows to be closed, and once they were, the connection went back
+  to the pool with the transaction still open — the pool's next statements
+  ran inside it and were never committed. The connection is now closed,
+  which ends the transaction on the server, and the function's error (or
+  the "busy streaming" one) is returned at once. `Transaction` no longer
+  waits for rows its function left open, buffered ones included: the
+  connection returns to the pool when they are closed.
+- **A statement on a dead connection while rows were open on it never
+  returned.** In the loop that reads rows from a `*sql.Conn` and runs a
+  statement per row, a write that failed returned `driver.ErrBadConn`,
+  `database/sql` closed the `*sql.Conn`, and that close waited for the
+  rows the same goroutine was reading. Such a statement now fails with
+  `skaidb: connection lost before the statement was sent: …`.
+- **A borrower's `USE` followed its connection back into the pool.** With
+  a database in the DSN, a `USE` sent on a `*sql.Conn` or through the
+  `*sql.DB` left that one pooled connection in another database, and
+  whoever got it next ran there — against a table of the same name,
+  silently. The DSN's database is now entered again before the connection
+  is handed to its next borrower; a connection that cannot be taken back
+  is closed. So with a database in the DSN, a `USE` lasts for the
+  `*sql.Conn` it was sent on and no longer. A `USE` is recognised with a
+  `--` comment behind or before it too (`USE other -- for the report`),
+  as the server accepts it. A DSN that names no database is unchanged: a
+  `USE` stays on the one connection it was sent on, and is gone when that
+  connection is replaced — name the database in the DSN.
+- **A prepare the server refused for lack of room was answered by sending
+  the statement as text.** On a connection holding the server's limit of
+  256 prepared statements, the statement ran with its arguments written
+  into it as literals, which types them differently (a `time.Time` stored
+  as an integer, a `[]byte` as the text of its hex digits). The driver's
+  own cache stays below the limit, so this takes statements prepared past
+  it; the refusal is now returned as the statement's error.
+
 ## [1.4.0] — 2026-11-15
 
 ### Added

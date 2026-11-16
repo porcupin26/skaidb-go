@@ -78,7 +78,7 @@ The module is a single package with no dependencies. `go mod vendor` works
 as usual; or point a `replace` at a checkout:
 
 ```
-require github.com/porcupin26/skaidb-go v1.4.0
+require github.com/porcupin26/skaidb-go v1.4.1
 replace github.com/porcupin26/skaidb-go => ../skaidb-go
 ```
 
