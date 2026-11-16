@@ -61,6 +61,7 @@ messages below are stable within the 1.x line.
 | `skaidb: bad consistency "…"` | `WithConsistency` with an unknown level; the statement did not run |
 | `skaidb: transaction conflict: …` | the server refused a `COMMIT` because another writer changed a row the transaction writes after it began. Matches `skaidb.ErrTransactionConflict` with `errors.Is`; only the `transaction conflict:` start of the server's text is fixed. Nothing was committed, the transaction is over and the connection stays usable: run the transaction again from its opening statement (`skaidb.Transaction` does) |
 | `skaidb: transaction attempts must be at least 1, got N` | `Transaction`/`TransactionConn` with `TxAttempts` below 1; nothing was sent |
+| `skaidb: transaction not committed: its connection was lost, or retired after a statement failed part-way, before COMMIT was sent: driver: bad connection` | `Transaction`/`TransactionConn`: the connection went inside the transaction and the function returned `nil` all the same, or the `COMMIT` could not be written. Matches `driver.ErrBadConn` with `errors.Is`. The server dropped the transaction with its session: nothing was committed, and running it again is safe |
 | `skaidb: transactions are not supported` | `Begin`/`BeginTx`: `*sql.Tx` is not wired — use `skaidb.Transaction` |
 | `skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow` | `Result.LastInsertId` |
 | `skaidb: connection is busy streaming a result set — close those rows before running another statement` | a second statement on a `*sql.Conn` whose streamed rows are still open |
@@ -92,7 +93,9 @@ against the member; enough in a row eject it for a while (see
 A statement error — a transaction conflict included — is none of these: the
 connection stays in the pool and nothing counts against the member.
 `skaidb.Transaction` runs a transaction again only after a conflict at
-`COMMIT`; it never retries a transport failure.
+`COMMIT`; it never retries a transport failure, and after one it sends
+nothing more of the transaction on any connection. Its opening statement
+alone moves to another connection when the pooled one it took is dead.
 
 ## Errors during a stream
 

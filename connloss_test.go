@@ -596,3 +596,159 @@ func TestTransactionConnDoesNotLeaveTheCallersConnection(t *testing.T) {
 	}
 	l.wantReceived([]string{`USE "app"`})
 }
+
+// ---- a connection lost inside a transaction ---------------------------------
+
+const (
+	second = "UPDATE accounts SET balance = 110 WHERE id = 2"
+	third  = "INSERT INTO ledger (id) VALUES (7)"
+)
+
+// carriesOn is a transaction function that does not stop at an error: its
+// second statement fails with the connection, it runs a third all the same,
+// and returns nil.
+func carriesOn(ctx context.Context, lose func(), e2, e3 *error) func(*sql.Conn) error {
+	return func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, updateSQL); err != nil {
+			return err
+		}
+		lose()
+		_, *e2 = conn.ExecContext(ctx, second)
+		_, *e3 = conn.ExecContext(ctx, third)
+		return nil
+	}
+}
+
+// No statement of a transaction leaves its session (PROTOCOL.md §6 rule 7).
+// The connection is lost under the function's second statement; the function
+// carries on and returns nil. Its third statement must fail as well — sent
+// on another connection it would commit on its own — and so must the
+// transaction, with a transport error that says what is known: COMMIT was
+// not sent, so nothing was committed. Nothing reaches the server on a
+// second connection, and the pool is usable afterwards as after any loss.
+func TestATransactionWhoseConnectionIsLostSendsNothingElsewhere(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		// lose makes connection 0 fail under the second statement.
+		reply func(conn int, sql string) []byte
+		lose  func(l *lossy)
+		// what connection 0 received of the transaction
+		want []string
+		e2   func(error) bool
+	}{
+		{
+			name: "the reply never comes",
+			reply: func(conn int, sql string) []byte {
+				if conn == 0 && sql == second {
+					return hangup
+				}
+				return nil
+			},
+			lose: func(*lossy) {},
+			want: []string{"BEGIN", updateSQL, second},
+			e2: func(err error) bool {
+				return err != nil && strings.Contains(err.Error(), "connection lost mid-statement")
+			},
+		},
+		{
+			name:  "the request cannot be written",
+			lose:  func(l *lossy) { l.kill(0) },
+			want:  []string{"BEGIN", updateSQL},
+			e2:    func(err error) bool { return errors.Is(err, driver.ErrBadConn) },
+			reply: nil,
+		},
+	} {
+		for _, pinned := range []bool{false, true} {
+			name := tc.name + ", Transaction"
+			if pinned {
+				name = tc.name + ", TransactionConn"
+			}
+			t.Run(name, func(t *testing.T) {
+				l, db := lossyServer(t, tc.reply)
+				var e2, e3, err error
+				fn := carriesOn(ctx, func() { tc.lose(l) }, &e2, &e3)
+				var held *sql.Conn
+				if pinned {
+					held, err = db.Conn(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer held.Close()
+					err = TransactionConn(ctx, held, fn)
+				} else {
+					err = Transaction(ctx, db, fn)
+				}
+				if !tc.e2(e2) {
+					t.Errorf("the statement the connection was lost under: err = %v, want the transport error", e2)
+				}
+				if e3 == nil {
+					t.Error("the statement after the loss succeeded")
+				}
+				if !errors.Is(err, driver.ErrBadConn) || !strings.Contains(err.Error(), "before COMMIT was sent") {
+					t.Errorf("the transaction: err = %v, want the lost connection reported, COMMIT not sent", err)
+				}
+				l.wantReceived(tc.want)
+				if pinned {
+					// The caller's *sql.Conn is as dead as after any loss, and
+					// still sends nothing.
+					if _, err := held.ExecContext(ctx, third); err == nil {
+						t.Error("a statement on the caller's lost connection succeeded")
+					}
+					l.wantReceived(tc.want)
+					held.Close()
+				}
+				// The pool dials for the next statement, as after any loss.
+				if _, err := db.ExecContext(ctx, "DELETE FROM audit"); err != nil {
+					t.Fatalf("an ordinary statement afterwards: %v", err)
+				}
+				l.wantReceived(tc.want, []string{"DELETE FROM audit"})
+			})
+		}
+	}
+}
+
+// When the loss is under the COMMIT itself the transaction's fate is not
+// known, and the error says so: it does not claim that nothing was
+// committed, and it is not one a caller would retry on.
+func TestATransactionLostUnderItsCommitDoesNotClaimARollback(t *testing.T) {
+	l, db := lossyServer(t, func(_ int, sql string) []byte {
+		if sql == "COMMIT" {
+			return hangup
+		}
+		return nil
+	})
+	ctx := context.Background()
+	runs := 0
+	err := Transaction(ctx, db, update(ctx, &runs))
+	if err == nil || !strings.Contains(err.Error(), "statement may or may not have applied") {
+		t.Fatalf("err = %v, want the mid-statement loss of the COMMIT", err)
+	}
+	if errors.Is(err, driver.ErrBadConn) || strings.Contains(err.Error(), "nothing was committed") {
+		t.Errorf("err = %v: the COMMIT was sent, its outcome is unknown", err)
+	}
+	if runs != 1 {
+		t.Errorf("the function ran %d times, want 1", runs)
+	}
+	l.wantReceived([]string{"BEGIN", updateSQL, "COMMIT"})
+}
+
+// A COMMIT that could not be written is the other case: it never left, so
+// the transaction was not committed, and the error is the same as for a
+// connection the function lost.
+func TestATransactionWhoseCommitCannotBeWrittenWasNotCommitted(t *testing.T) {
+	l, db := lossyServer(t, nil)
+	ctx := context.Background()
+	runs := 0
+	err := Transaction(ctx, db, func(conn *sql.Conn) error {
+		l.killAfter(0, 1) // the function's statement, and no more
+		return update(ctx, &runs)(conn)
+	})
+	if !errors.Is(err, driver.ErrBadConn) || !strings.Contains(err.Error(), "before COMMIT was sent") {
+		t.Fatalf("err = %v, want the lost connection reported, COMMIT not sent", err)
+	}
+	if runs != 1 {
+		t.Errorf("the function ran %d times, want 1", runs)
+	}
+	l.wantReceived([]string{"BEGIN", updateSQL})
+}

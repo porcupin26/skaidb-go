@@ -130,6 +130,15 @@ func newTxConfig(opts []TxOption) (txConfig, error) {
 // A transport failure or an expired context anywhere is the usual error for
 // it and is not retried. If body panics, ROLLBACK is sent before the panic
 // carries on.
+//
+// A connection lost inside the transaction ends it: the server drops a
+// transaction with its session. No statement after the loss is sent anywhere
+// — on another connection it would commit on its own — so if body carries on
+// past the error its later statements fail too, and when it returns nil all
+// the same, Transaction returns an error that matches driver.ErrBadConn and
+// says COMMIT was not sent: nothing was committed. Only a connection lost
+// under the COMMIT itself leaves the outcome unknown ("connection lost
+// mid-statement (statement may or may not have applied)").
 func Transaction(ctx context.Context, db *sql.DB, body func(conn *sql.Conn) error, opts ...TxOption) error {
 	cfg, err := newTxConfig(opts)
 	if err != nil {
@@ -232,16 +241,46 @@ func runTransaction(ctx context.Context, begin func() (*sql.Conn, error), body f
 		if err != nil {
 			return err
 		}
+		dc := driverConn(c)
 		if err := runBody(ctx, c, body); err != nil {
 			return err
+		}
+		if dc != nil && dc.broken.Load() {
+			// body lost the connection and returned nil all the same. The
+			// transaction went with the session; there is nothing to commit
+			// and nowhere to send a COMMIT.
+			return errNotCommitted
 		}
 		// A COMMIT that fails has ended the transaction, whatever the reason,
 		// so no ROLLBACK follows it.
 		_, err = c.ExecContext(ctx, "COMMIT")
+		if errors.Is(err, driver.ErrBadConn) {
+			// The COMMIT itself could not be written.
+			return errNotCommitted
+		}
 		if err == nil || attempt >= cfg.attempts || !errors.Is(err, ErrTransactionConflict) {
 			return err
 		}
 	}
+}
+
+// errNotCommitted is Transaction's error when the connection went before the
+// COMMIT could be sent. It matches driver.ErrBadConn — the connection is
+// gone and nothing reached the server — and says what follows from it for
+// the transaction. A loss under the COMMIT itself is not this error: then
+// the outcome is unknown, and the COMMIT's own error says so.
+var errNotCommitted = fmt.Errorf("skaidb: transaction not committed: its connection was lost, or retired after a statement failed part-way, before COMMIT was sent: %w", driver.ErrBadConn)
+
+// driverConn is the driver's connection under c: nil for a *sql.Conn that is
+// closed or another driver's. Outside Raw only what any goroutine may touch
+// is used of it: its atomic flags.
+func driverConn(c *sql.Conn) *conn {
+	var dc *conn
+	_ = c.Raw(func(driverConn any) error {
+		dc, _ = driverConn.(*conn)
+		return nil
+	})
+	return dc
 }
 
 // runBody runs body and rolls the transaction back when it does not return

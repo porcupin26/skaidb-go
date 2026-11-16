@@ -668,7 +668,16 @@ statement, at once and on the same connection, up to three runs in all.
   returned. Any other `COMMIT` error is returned as it is, with no retry
   and no `ROLLBACK`: a failed `COMMIT` has ended the transaction.
 - A transport failure or an expired context is the usual error for it and
-  is never retried.
+  is never retried. **A connection lost inside the transaction ends it** —
+  the server drops a transaction with its session — and no statement after
+  the loss is sent anywhere: on another connection it would commit on its
+  own. A function that carries on past the error sees its later statements
+  fail too, and if it returns `nil` all the same, `Transaction` returns
+  `skaidb: transaction not committed: …`, which matches
+  `driver.ErrBadConn`: `COMMIT` was not sent, nothing was committed. Only
+  a connection lost under the `COMMIT` itself leaves the outcome unknown
+  (`skaidb: connection lost mid-statement (statement may or may not have
+  applied): …`).
 
 ```go
 err := skaidb.Transaction(ctx, db, fn,
@@ -1041,6 +1050,7 @@ context errors, `driver.ErrBadConn` — and this package's
 | bad consistency in `WithConsistency` | `skaidb: bad consistency "…"` |
 | a `COMMIT` refused because another writer changed a row the transaction writes | `skaidb: transaction conflict: …` — matches `skaidb.ErrTransactionConflict` (via `errors.Is`); nothing was committed and the connection stays usable |
 | `Transaction` / `TransactionConn` with `TxAttempts` below 1 | `skaidb: transaction attempts must be at least 1, got N` — nothing was sent |
+| `Transaction` / `TransactionConn` whose connection went before `COMMIT` could be sent | `skaidb: transaction not committed: its connection was lost, or retired after a statement failed part-way, before COMMIT was sent: driver: bad connection` — matches `driver.ErrBadConn` (via `errors.Is`); nothing was committed |
 | `db.Begin` / `db.BeginTx` | `skaidb: transactions are not supported` — `*sql.Tx` is not wired; use [`Transaction`](#transactions) |
 | `LastInsertId` | `skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow` |
 | second statement during a stream on the same `*sql.Conn` | `skaidb: connection is busy streaming a result set — close those rows before running another statement` |
