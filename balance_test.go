@@ -32,7 +32,8 @@ import (
 // probe) answers no rows, anything else is a one-row mutation. refuse
 // closes each new connection before the handshake; deny refuses the login;
 // oldServer answers SHOW ENDPOINTS with a parse error; conflict refuses
-// every COMMIT with a transaction conflict.
+// every COMMIT with a transaction conflict; refuseUse refuses every USE. It
+// keeps what each connection sent, in order (received).
 type fakeMember struct {
 	name      string
 	endpoint  string
@@ -44,10 +45,23 @@ type fakeMember struct {
 	deny      atomic.Bool
 	oldServer atomic.Bool
 	conflict  atomic.Bool
+	refuseUse atomic.Bool
 	listings  atomic.Int64 // SHOW ENDPOINTS asked
 
 	mu      sync.Mutex
 	listing func() []listedEndpoint
+	stmts   [][]string // statements received, per connection in accept order
+}
+
+// received is what each connection sent the member, in accept order.
+func (m *fakeMember) received() [][]string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([][]string, len(m.stmts))
+	for i, c := range m.stmts {
+		out[i] = append([]string(nil), c...)
+	}
+	return out
 }
 
 func newFakeMember(t *testing.T, v *vectors, name string) *fakeMember {
@@ -82,14 +96,18 @@ func (m *fakeMember) accept() {
 			s.Close()
 			continue
 		}
+		m.mu.Lock()
+		n := len(m.stmts)
+		m.stmts = append(m.stmts, nil)
+		m.mu.Unlock()
 		go func() {
 			defer s.Close()
-			m.serve(s)
+			m.serve(n, s)
 		}()
 	}
 }
 
-func (m *fakeMember) serve(s net.Conn) {
+func (m *fakeMember) serve(conn int, s net.Conn) {
 	start, err := fakeRead(s)
 	if err != nil || len(start) == 0 || start[0] != 10 {
 		return
@@ -131,8 +149,13 @@ func (m *fakeMember) serve(s net.Conn) {
 		}
 		n := binary.LittleEndian.Uint32(req[2:])
 		text := string(req[6 : 6+n])
+		m.mu.Lock()
+		m.stmts[conn] = append(m.stmts[conn], text)
+		m.mu.Unlock()
 		var resp []byte
 		switch {
+		case strings.HasPrefix(text, "USE ") && m.refuseUse.Load():
+			resp = appendStr([]byte{3}, "database does not exist")
 		case text == "SHOW ENDPOINTS":
 			m.listings.Add(1)
 			m.mu.Lock()
