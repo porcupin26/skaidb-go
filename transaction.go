@@ -277,7 +277,7 @@ func runTransaction(ctx context.Context, begin func() (*sql.Conn, error), body f
 		// A COMMIT that fails has ended the transaction, whatever the reason,
 		// so no ROLLBACK follows it.
 		_, err = c.ExecContext(ctx, "COMMIT")
-		if errors.Is(err, driver.ErrBadConn) || errors.Is(err, errNotSent) {
+		if errors.Is(err, driver.ErrBadConn) || errors.Is(err, errNotSent) || errors.Is(err, errTxLost) {
 			// The COMMIT itself could not be written.
 			return errNotCommitted
 		}
@@ -287,12 +287,20 @@ func runTransaction(ctx context.Context, begin func() (*sql.Conn, error), body f
 	}
 }
 
-// errNotCommitted is Transaction's error when the connection went before the
-// COMMIT could be sent. It matches driver.ErrBadConn — the connection is
-// gone and nothing reached the server — and says what follows from it for
-// the transaction. A loss under the COMMIT itself is not this error: then
-// the outcome is unknown, and the COMMIT's own error says so.
-var errNotCommitted = fmt.Errorf("skaidb: transaction not committed: its connection was lost, or retired after a statement failed part-way, before COMMIT was sent: %w", driver.ErrBadConn)
+// errNotCommitted is the error of a transaction whose connection went
+// before its COMMIT could be sent: Transaction's, and that of a COMMIT sent
+// by hand on such a connection (conn.endLost). It matches driver.ErrBadConn
+// — the connection is gone and nothing reached the server — and says what
+// follows from it for the transaction. A loss under the COMMIT itself is
+// not this error: then the outcome is unknown, and the COMMIT's own error
+// says so.
+var errNotCommitted = fmt.Errorf("%w: %w", errTxLost, driver.ErrBadConn)
+
+// errTxLost is errNotCommitted without driver.ErrBadConn in it, for a COMMIT
+// sent by hand while a result set is open on its *sql.Conn: database/sql
+// closes a *sql.Conn on driver.ErrBadConn, and that close would wait for
+// the rows (see transportErr).
+var errTxLost = errors.New("skaidb: transaction not committed: its connection was lost, or retired after a statement failed part-way, before COMMIT was sent")
 
 // driverConn is the driver's connection under c: nil for a *sql.Conn that is
 // closed or another driver's. Outside Raw only what any goroutine may touch

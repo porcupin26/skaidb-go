@@ -744,6 +744,32 @@ again. `database/sql`'s own
 `db.Begin()` / `db.BeginTx()` are not wired to any of this and return
 `skaidb: transactions are not supported`.
 
+A connection lost inside a hand-written transaction ends it, as inside the
+helper: the server drops the transaction with its session, and nothing of
+it is sent on another connection. What you see depends on where the loss
+shows:
+
+- **Before a statement is written** — the write fails, or the driver finds
+  the socket closed. The statement returns `driver.ErrBadConn`,
+  `database/sql` closes the `*sql.Conn`, and everything after it on that
+  `*sql.Conn`, `COMMIT` and `ROLLBACK` included, returns `sql: connection
+  is already closed`. When it is the `COMMIT` that finds the connection
+  gone, its error is `skaidb: transaction not committed: …` (it matches
+  `driver.ErrBadConn`); a `ROLLBACK` in that place succeeds. Nothing was
+  committed.
+- **Under a statement** — the request left and no answer came, or its
+  context ran out. That statement returns its error and the `*sql.Conn`
+  stays yours; the driver answers the rest without sending anything.
+  Further statements fail (`skaidb: connection is retired: …`). `ROLLBACK`
+  succeeds: the transaction went with the connection, which is what it
+  asks for. `COMMIT` fails with `skaidb: transaction not committed: …`.
+- **Under the `COMMIT` itself** — `skaidb: connection lost mid-statement
+  (statement may or may not have applied): …`. The outcome is unknown and
+  the error claims neither; a `ROLLBACK` behind it is not answered with
+  success.
+
+Either way that `*sql.Conn` is finished: close it and take another.
+
 ## Streaming large results
 
 A plain `SELECT` is materialised on the coordinator and bounded by the

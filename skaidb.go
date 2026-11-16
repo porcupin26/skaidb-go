@@ -494,8 +494,7 @@ func useSQL(name string) string {
 // exception: a COMMIT or a ROLLBACK ends the transaction whatever the
 // answer. A COMMIT that is refused — as a conflict, say — has ended its
 // transaction too (PROTOCOL.md §6 rule 6).
-func (c *conn) note(sqlText string, ok bool) {
-	kind, database := sessionStatement(sqlText)
+func (c *conn) note(kind sessionKind, database string, ok bool) {
 	if kind == transactionCommit || kind == transactionRollback {
 		c.inTx = false
 		return
@@ -517,6 +516,44 @@ func (c *conn) note(sqlText string, ok bool) {
 	case transactionBegin:
 		c.inTx = true
 	}
+}
+
+// endLost answers the COMMIT or ROLLBACK of a transaction whose connection
+// is gone: found gone before the statement was sent (cause is nil then, or
+// says so — driver.ErrBadConn, errNotSent), or lost under it (cause is what
+// the statement returned). answered is false for anything else, and err is
+// then cause as it came.
+//
+// A transaction lives on the connection that began it (PROTOCOL.md §6
+// rule 7): the server dropped it with the session, and nothing of it is to
+// be sent anywhere else. So its owner ends it here, on the connection
+// object, and neither statement is written:
+//
+//   - ROLLBACK succeeds. What it asks for has happened.
+//   - COMMIT fails, and says that the connection was lost and nothing was
+//     committed — unless it was the COMMIT itself that left and was never
+//     answered: then the outcome is not known, and cause, the mid-statement
+//     loss, says exactly that.
+//
+// Either way the transaction is over as far as this connection is
+// concerned: the next statement on it is one on a retired connection, no
+// more.
+func (c *conn) endLost(kind sessionKind, cause error) (answered bool, err error) {
+	if !c.inTx || !c.broken.Load() || kind != transactionCommit && kind != transactionRollback {
+		return false, cause
+	}
+	sent := cause != nil && !errors.Is(cause, driver.ErrBadConn) && !errors.Is(cause, errNotSent)
+	c.inTx = false
+	switch {
+	case kind == transactionRollback:
+		return true, nil
+	case sent:
+		return true, cause
+	case c.results.Load() > 0:
+		// Not driver.ErrBadConn while a result set is open: see transportErr.
+		return true, errTxLost
+	}
+	return true, errNotCommitted
 }
 
 // sessionKind is what a statement does to the session it runs in.
@@ -1779,13 +1816,35 @@ func (c *conn) sendQuery(sqlText string) (*reader, error) {
 }
 
 func (c *conn) query(sqlText string) (driver.Rows, error) {
-	r, err := c.sendQuery(sqlText)
+	kind, database := sessionStatement(sqlText)
+	r, err := c.sendSession(kind, sqlText)
 	if err != nil {
 		return nil, err
 	}
+	if r == nil { // answered here: endLost
+		return &rows{cols: []string{}}, nil
+	}
 	rs, err := c.readRows(r)
-	c.note(sqlText, err == nil)
+	c.note(kind, database, err == nil)
 	return rs, err
+}
+
+// sendSession is sendQuery for a statement of the given kind: the COMMIT or
+// ROLLBACK of a transaction whose connection is gone is answered here
+// instead of sent (endLost) — with an error, or with a nil reader for
+// success.
+func (c *conn) sendSession(kind sessionKind, sqlText string) (*reader, error) {
+	if c.broken.Load() {
+		if answered, err := c.endLost(kind, nil); answered {
+			return nil, err
+		}
+	}
+	r, err := c.sendQuery(sqlText)
+	if err != nil {
+		_, err = c.endLost(kind, err)
+		return nil, err
+	}
+	return r, nil
 }
 
 // readRowsBody parses a Rows frame whose tag has already been consumed.
@@ -1882,12 +1941,16 @@ func unknownTag(tag byte) error {
 }
 
 func (c *conn) exec(sqlText string) (driver.Result, error) {
-	r, err := c.sendQuery(sqlText)
+	kind, database := sessionStatement(sqlText)
+	r, err := c.sendSession(kind, sqlText)
 	if err != nil {
 		return nil, err
 	}
+	if r == nil { // answered here: endLost
+		return result{}, nil
+	}
 	res, err := c.readResult(r)
-	c.note(sqlText, err == nil)
+	c.note(kind, database, err == nil)
 	return res, err
 }
 
@@ -2032,7 +2095,8 @@ func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Row
 		return c.readRows(&reader{buf: frame})
 	case 1, 2: // Mutation / Ddl through a streaming call
 		if len(args) == 0 {
-			c.note(sqlText, true)
+			kind, database := sessionStatement(sqlText)
+			c.note(kind, database, true)
 		}
 		return &rows{cols: []string{}, done: true}, nil
 	case 3:
@@ -2051,7 +2115,8 @@ func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Row
 			return nil, fmt.Errorf("%w: %s", errUnpreparable, msg)
 		}
 		if len(args) == 0 {
-			c.note(sqlText, false)
+			kind, database := sessionStatement(sqlText)
+			c.note(kind, database, false)
 		}
 		return nil, serverError(msg)
 	}
