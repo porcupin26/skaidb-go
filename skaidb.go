@@ -395,6 +395,9 @@ func (c *conn) ResetSession(ctx context.Context) error {
 // between the two is the round trip a balancing Connector averages per
 // member, and a transport failure counts against the member.
 func (c *conn) roundTrip(req []byte) (frame []byte, sent bool, err error) {
+	if c.broken.Load() {
+		return nil, false, errRetired
+	}
 	start := time.Now()
 	if err := c.writeFrame(req); err != nil {
 		c.observeFailure()
@@ -427,14 +430,45 @@ func (c *conn) observeFailure() {
 // fate is unknown: it may have been applied and only the reply lost. Retrying
 // then could double-apply a non-idempotent write (an UPDATE ... SET n = n + 1
 // is not an upsert), so the error is surfaced to the caller instead. The
-// connection is marked broken either way.
+// connection is retired either way.
 func (c *conn) transportErr(err error, sent bool) error {
-	c.broken.Store(true)
+	if err == errRetired {
+		return err
+	}
+	c.retire()
 	if !sent {
 		return driver.ErrBadConn
 	}
 	return fmt.Errorf("skaidb: connection lost mid-statement (statement may or may not have applied): %w", err)
 }
+
+// retire takes the connection out of use for good: it is marked broken, so
+// database/sql discards it (IsValid), and its socket is closed there and
+// then. The server ends the session when the socket closes — and with it a
+// transaction the session had open, and the rows that transaction claimed —
+// rather than when database/sql gets round to closing the connection, which
+// for a pinned *sql.Conn is whenever its owner does.
+func (c *conn) retire() {
+	c.broken.Store(true)
+	nc := c.nc
+	if tc, ok := nc.(*tls.Conn); ok {
+		// Without TLS's closing alert: the connection failed part-way, and
+		// writing to a peer that has stopped reading could wait.
+		nc = tc.NetConn()
+	}
+	_ = nc.Close()
+}
+
+// errRetired answers a statement on a connection that was retired earlier:
+// only a pinned *sql.Conn can send one, the pool never hands a retired
+// connection out. Nothing is written — the socket is closed, and before it
+// was, the reply to the statement that failed could still have been on its
+// way, to be read as the answer to this one.
+//
+// It is deliberately not driver.ErrBadConn: that makes database/sql close
+// the *sql.Conn on the spot, which waits for every *sql.Rows still open on
+// it — forever, when the caller is the goroutine reading them.
+var errRetired = errors.New("skaidb: connection is retired: an earlier statement on it failed or was cancelled part-way and its socket is closed — nothing was sent")
 
 // dial tries the seeds until one connects AND authenticates, so a node that
 // accepts TCP but is unhealthy does not swallow the attempt. The order is
@@ -687,7 +721,11 @@ func (c *conn) Close() error {
 	if c.lb != nil {
 		c.lb.released(c.member)
 	}
-	return c.nc.Close()
+	err := c.nc.Close()
+	if c.broken.Load() {
+		return nil // retire closed the socket already
+	}
+	return err
 }
 
 // database/sql's own transaction API (db.Begin / db.BeginTx, *sql.Tx) is not
@@ -924,6 +962,7 @@ func (c *conn) applyContext(ctx context.Context) func(error) error {
 	}
 	done := make(chan struct{})   // closed by finish: the statement is over
 	exited := make(chan struct{}) // closed by the watcher on its way out
+	fired := false                // the watcher's; finish reads it once exited is closed
 	go func() {
 		defer close(exited)
 		select {
@@ -936,6 +975,7 @@ func (c *conn) applyContext(ctx context.Context) func(error) error {
 				return
 			default:
 			}
+			fired = true
 			if errors.Is(ctx.Err(), context.Canceled) {
 				c.cancelled.Store(true)
 			}
@@ -949,6 +989,10 @@ func (c *conn) applyContext(ctx context.Context) func(error) error {
 		once.Do(func() {
 			close(done)
 			<-exited
+			if fired {
+				c.retire()
+				return
+			}
 			_ = c.nc.SetDeadline(time.Time{})
 		})
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -1249,7 +1293,7 @@ func (c *conn) closePrepared(id uint32) {
 	}
 	req := binary.LittleEndian.AppendUint32([]byte{4}, id)
 	if _, _, err := c.roundTrip(req); err != nil {
-		c.broken.Store(true)
+		c.retire()
 	}
 }
 
@@ -1537,7 +1581,7 @@ func (c *conn) streamQuery(sqlText string, args []driver.NamedValue) (driver.Row
 		if r.err != nil {
 			// A truncated header leaves the chunks behind it unread and no
 			// way to tell where the next frame starts.
-			c.broken.Store(true)
+			c.retire()
 			return nil, r.err
 		}
 		// Busy until RowsEnd or Error; rows.Close hands the socket back.
@@ -1632,7 +1676,7 @@ func (r *rows) fill() error {
 				// Half a chunk decoded: the frame boundary is still good, but
 				// the rest of the stream is not ours to interpret any more.
 				r.endStream()
-				r.c.broken.Store(true)
+				r.c.retire()
 				return rd.err
 			}
 			r.data, r.pos = data, 0
@@ -1647,7 +1691,7 @@ func (r *rows) fill() error {
 			return serverError(rd.text())
 		default:
 			r.endStream()
-			r.c.broken.Store(true)
+			r.c.retire()
 			return fmt.Errorf("skaidb: unexpected frame in stream")
 		}
 	}
@@ -1714,7 +1758,7 @@ func (r *rows) abandon() {
 	for i := 0; i < drainMaxFrames; i++ {
 		frame, err := r.c.readFrame()
 		if err != nil {
-			r.c.broken.Store(true)
+			r.c.retire()
 			return
 		}
 		budget -= len(frame)
@@ -1723,17 +1767,17 @@ func (r *rows) abandon() {
 			return
 		case 6: // RowsChunk: discarded unparsed, only its size matters here
 			if budget < 0 {
-				r.c.broken.Store(true)
+				r.c.retire()
 				return
 			}
 		default:
 			// Not a stream frame at all, so the connection was already out of
 			// step; there is nothing to resynchronise to.
-			r.c.broken.Store(true)
+			r.c.retire()
 			return
 		}
 	}
-	r.c.broken.Store(true)
+	r.c.retire()
 }
 
 // Close ends the result set, and is the hook where an abandoned stream is made

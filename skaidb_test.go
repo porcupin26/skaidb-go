@@ -77,6 +77,9 @@ func TestApplyContextCancelUnblocksAndRetiresConn(t *testing.T) {
 	if c.IsValid() {
 		t.Fatal("an interrupted connection must not be reused: IsValid should be false")
 	}
+	if !socketClosed(c) {
+		t.Fatal("an interrupted connection's socket must be closed, not left for database/sql to get round to")
+	}
 }
 
 // A deadline that has already passed behaves the same way and surfaces as

@@ -65,6 +65,7 @@ messages below are stable within the 1.x line.
 | `skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow` | `Result.LastInsertId` |
 | `skaidb: connection is busy streaming a result set — close those rows before running another statement` | a second statement on a `*sql.Conn` whose streamed rows are still open |
 | `skaidb: connection closed` | a statement on a `*sql.Conn` after `Close` |
+| `skaidb: connection is retired: an earlier statement on it failed or was cancelled part-way and its socket is closed — nothing was sent` | a statement on a `*sql.Conn` whose connection the driver has retired (see below); close the `*sql.Conn` and take another |
 
 ## Transport failures and retries
 
@@ -75,9 +76,15 @@ messages below are stable within the 1.x line.
 | the context expired / was cancelled | `context.DeadlineExceeded` / `context.Canceled` (via `errors.Is`); the connection is retired | only if idempotent |
 | a corrupt or unexpected frame | `skaidb: truncated server message`, `skaidb: unknown response tag N`, `skaidb: unknown value tag N`, `skaidb: unexpected frame in stream`; the connection is retired | investigate; this indicates a protocol mismatch |
 
-"Retired" means the driver reports the connection invalid and
-`database/sql` closes it before the next checkout; the replacement dial
-walks the members, which is where failover to another node happens. A
+"Retired" means the driver closes the connection's socket there and then
+— the server ends the session, and with it a transaction the session had
+open — and reports the connection invalid, so `database/sql` drops it
+before the next checkout; the replacement dial walks the members, which is
+where failover to another node happens. The pool never hands a retired
+connection out. A `*sql.Conn` you hold keeps pointing at it: every further
+statement on it fails with `skaidb: connection is retired: …` and nothing
+is written, so no statement can read the reply the failed one left behind.
+A
 transport failure (or an expired deadline, not a cancellation) also counts
 against the member; enough in a row eject it for a while (see
 [dsn.md](dsn.md#load-balancing)).

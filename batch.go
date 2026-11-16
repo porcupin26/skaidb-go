@@ -232,7 +232,7 @@ func (c *conn) sendBatchChunk(req []byte, start int) (int64, bool, error) {
 		}
 		return 0, false, serverError(msg)
 	default:
-		c.broken.Store(true)
+		c.retire()
 		return 0, false, fmt.Errorf("skaidb: unexpected response tag %d to a batch", tag)
 	}
 }

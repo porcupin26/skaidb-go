@@ -29,10 +29,13 @@ at once; the call returns `context.Canceled`.
 
 An interrupted statement leaves the connection mid-frame — the reply may
 be half read, or still on its way — so it cannot be reused. The driver
-marks it broken; `database/sql` asks the driver whether a connection is
-valid before every reuse, gets "no", closes it, and dials a fresh one (which
-goes through the load-balancing connector). You never see a poisoned
-connection, at the cost of one dial per cancelled statement.
+retires it: the socket is closed at once, which also ends the session on
+the server and a transaction it had open, and `database/sql`, which asks
+the driver whether a connection is valid before every reuse, gets "no" and
+dials a fresh one (through the load-balancing connector). You never see a
+poisoned connection, at the cost of one dial per cancelled statement. On a
+`*sql.Conn` you hold, the statements after the interrupted one fail with
+`skaidb: connection is retired: …` until you close it and take another.
 
 A context that is cancelled once its statement has returned — `defer
 cancel()` — touches nothing: the connection stays as the statement left it.

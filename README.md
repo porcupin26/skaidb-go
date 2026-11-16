@@ -830,9 +830,9 @@ Every `…Context` method honours its context:
 - A **deadline** becomes the socket deadline for the statement. On a
   streamed result it covers the whole stream.
 - **Cancellation** forces a blocked read or write to return at once. The
-  statement is interrupted mid-frame, so the connection is marked broken and
-  discarded by the pool; the *statement's* fate on the server is unknown (a
-  write may or may not have applied).
+  statement is interrupted mid-frame, so the connection is retired — its
+  socket is closed there and then, and the pool drops it; the *statement's*
+  fate on the server is unknown (a write may or may not have applied).
 - The returned error satisfies `errors.Is(err, context.DeadlineExceeded)` /
   `context.Canceled`, as with any other driver.
 
@@ -865,9 +865,13 @@ apply (`SetMaxOpenConns`, `SetMaxIdleConns`, `SetConnMaxLifetime`,
 Each pooled connection is a single socket that serialises one request /
 one response; concurrency comes from the pool, not from pipelining. A
 connection broken by a transport error, a cancelled statement or an
-undrainable abandoned stream fails `IsValid` and is closed by the pool
-before the next checkout; the replacement dial goes through the
-[balancing](#balancing-across-members) connector. When
+undrainable abandoned stream is retired: the driver closes its socket at
+once — the server ends the session and any transaction it had open — and
+it fails `IsValid`, so the pool drops it before the next checkout; the
+replacement dial goes through the
+[balancing](#balancing-across-members) connector. A `*sql.Conn` that holds
+a retired connection gets `skaidb: connection is retired: …` for every
+further statement, and nothing is written. When
 the request had **not** reached the wire, the driver returns
 `driver.ErrBadConn` and `database/sql` retries the statement on a fresh
 connection transparently; when it had, the error is surfaced (see
@@ -1037,6 +1041,7 @@ context errors, `driver.ErrBadConn` — and this package's
 | connection lost before the request was written | `driver.ErrBadConn` (retried by `database/sql` on another connection; never visible to you unless every retry fails) |
 | connection lost after the request was written | `skaidb: connection lost mid-statement (statement may or may not have applied): <io error>` — the write's fate is unknown; the driver does not retry |
 | deadline / cancellation | `context.DeadlineExceeded` / `context.Canceled` (via `errors.Is`) |
+| a statement on a `*sql.Conn` whose connection was retired by an earlier failure | `skaidb: connection is retired: an earlier statement on it failed or was cancelled part-way and its socket is closed — nothing was sent` |
 | corrupt or unexpected frame | `skaidb: truncated server message`, `skaidb: unknown response tag N`, `skaidb: unexpected frame in stream` — the connection is retired |
 
 Errors ending a **stream** mid-way arrive from `rows.Next()` → `rows.Err()`;

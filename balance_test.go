@@ -802,6 +802,47 @@ func TestAConnectionToAnEjectedMemberIsClosedOnReturn(t *testing.T) {
 	}
 }
 
+// A statement on a connection that was retired earlier is refused before
+// anything is written, so it is not another failure of the member: only the
+// deadline that retired the connection counts against it.
+func TestStatementsOnARetiredConnectionDoNotCountAgainstTheMember(t *testing.T) {
+	ms := fakeMembers(t, "a", "b")
+	c, db := lbDB(t, endpointsOf(ms), "eject_errors=2")
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var on *fakeMember
+	for _, m := range ms {
+		if m.name == who(t, conn) {
+			on = m
+		}
+	}
+	on.delay.Store(int64(300 * time.Millisecond))
+	short, cancel := context.WithTimeout(ctx, 30*time.Millisecond)
+	var name string
+	err = conn.QueryRowContext(short, "SELECT member()").Scan(&name)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := conn.ExecContext(ctx, "DELETE FROM t"); !errors.Is(err, errRetired) {
+			t.Fatalf("statement %d on the retired connection: err = %v, want the retired-connection error", i, err)
+		}
+	}
+	memberAt(t, c, on.endpoint, func(m *member) {
+		if m.errors != 1 {
+			t.Errorf("%d failures counted against %s, want the deadline's one", m.errors, on.name)
+		}
+	})
+	if state := stateOf(c, on.endpoint); state != "ready" {
+		t.Errorf("member %s is %q, want ready", on.name, state)
+	}
+}
+
 // The read-your-writes idiom under database/sql: a *sql.Conn stays on the
 // member that coordinated its write, while the pool keeps rotating.
 func TestASQLConnStaysOnTheMemberThatTookTheWrite(t *testing.T) {
