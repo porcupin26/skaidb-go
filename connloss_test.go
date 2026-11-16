@@ -37,6 +37,8 @@ type lossy struct {
 	// The connection whose next OP_PREPARE is answered with a closed socket;
 	// -1 for none.
 	dropPrepare atomic.Int64
+	// Executes that named a statement id the connection never issued.
+	unknownIDs atomic.Int64
 
 	mu       sync.Mutex
 	accepted chan struct{}
@@ -117,7 +119,15 @@ func (l *lossy) serve(n int, s net.Conn) {
 			}
 			continue
 		case 3, 7: // OP_EXECUTE, OP_EXECUTE_BATCH
-			text = prepared[binary.LittleEndian.Uint32(req[2:])-1]
+			id := binary.LittleEndian.Uint32(req[2:])
+			if id == 0 || int(id) > len(prepared) {
+				l.unknownIDs.Add(1)
+				if _, err := s.Write(errorFrame("unknown prepared statement id")); err != nil {
+					return
+				}
+				continue
+			}
+			text = prepared[id-1]
 		default:
 			if _, err := s.Write(errorFrame("unexpected request")); err != nil {
 				return

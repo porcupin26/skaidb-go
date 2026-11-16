@@ -211,3 +211,93 @@ func TestAStatementKindThatCannotBePreparedIsStillBoundAsText(t *testing.T) {
 		t.Fatalf("requests = %q, want the prepare and then the statement as text", reqs)
 	}
 }
+
+// ---- a statement id is its connection's -------------------------------------
+
+const (
+	stmtA = "UPDATE t SET v = ? WHERE id = ?"
+	stmtB = "DELETE FROM t WHERE v = ? AND id = ?" // as many parameters, another effect
+)
+
+// A prepared statement's id is an index on the connection that issued it:
+// on another connection the same id is unknown, or names whatever was
+// prepared there first. A and B are prepared on one connection, which is
+// then lost; on its replacement B runs first — and takes the id A had —
+// then A, through what the application held before the loss. Each runs as
+// itself: the ids live in the connection's own cache, a new connection
+// starts with none, and database/sql prepares a *sql.Stmt anew on every
+// connection it runs it on. The fake server resolves each execute through
+// the ids it issued on that connection, so what it records is what ran.
+func TestAPreparedStatementRunsAsItselfOnAReplacedConnection(t *testing.T) {
+	ctx := context.Background()
+	for name, handles := range map[string]func(t *testing.T, db *sql.DB) (a, b func() error){
+		"*sql.Stmt": func(t *testing.T, db *sql.DB) (func() error, func() error) {
+			a, err := db.PrepareContext(ctx, stmtA)
+			if err != nil {
+				t.Fatal(err)
+			}
+			b, err := db.PrepareContext(ctx, stmtB)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { a.Close(); b.Close() })
+			return func() error { _, err := a.ExecContext(ctx, 1, 2); return err },
+				func() error { _, err := b.ExecContext(ctx, 1, 2); return err }
+		},
+		"db.Exec with arguments": func(t *testing.T, db *sql.DB) (func() error, func() error) {
+			return func() error { _, err := db.ExecContext(ctx, stmtA, 1, 2); return err },
+				func() error { _, err := db.ExecContext(ctx, stmtB, 1, 2); return err }
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l, db := lossyServer(t, nil)
+			a, b := handles(t, db)
+			for _, run := range []func() error{a, b} { // connection 0: A is id 1, B id 2
+				if err := run(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			l.kill(0)
+			for _, run := range []func() error{b, a} { // connection 1: B is id 1
+				if err := run(); err != nil {
+					t.Fatalf("after the connection was replaced: %v", err)
+				}
+			}
+			l.wantReceived([]string{stmtA, stmtB}, []string{stmtB, stmtA})
+			if n := l.unknownIDs.Load(); n != 0 {
+				t.Errorf("%d executes named an id their connection never issued", n)
+			}
+		})
+	}
+}
+
+// The same for a *sql.Stmt that database/sql runs on another pooled
+// connection than the one it was first used on: it is prepared there, under
+// that connection's id.
+func TestASQLStmtIsPreparedOnEachConnectionItRunsOn(t *testing.T) {
+	l, db := lossyServer(t, nil)
+	ctx := context.Background()
+	a, err := db.PrepareContext(ctx, stmtA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err := a.ExecContext(ctx, 1, 2); err != nil { // connection 0: A is id 1
+		t.Fatal(err)
+	}
+	held, err := db.Conn(ctx) // connection 0 is taken ...
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	if _, err := db.ExecContext(ctx, stmtB, 1, 2); err != nil { // ... so this is connection 1: B is id 1
+		t.Fatal(err)
+	}
+	if _, err := a.ExecContext(ctx, 1, 2); err != nil { // and A's id 1 means B there
+		t.Fatal(err)
+	}
+	l.wantReceived([]string{stmtA}, []string{stmtB, stmtA})
+	if n := l.unknownIDs.Load(); n != 0 {
+		t.Errorf("%d executes named an id their connection never issued", n)
+	}
+}
