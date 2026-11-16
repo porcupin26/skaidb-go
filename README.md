@@ -429,8 +429,8 @@ For the curious, and for anyone using `driver` types directly:
 | `driver.Driver`, `driver.DriverContext` | `OpenConnector(dsn)` parses the DSN at `sql.Open` (a malformed DSN fails there, nothing is dialled); `Open(dsn)` parses and dials, for code that holds the driver value directly |
 | `driver.Connector`, `io.Closer` | `*Connector`: one dial per pooled connection, to the member the balancing policy picks; `db.Driver()` returns the registered driver; `db.Close()` closes it |
 | `driver.Conn` | `Prepare`, `Close`; `Begin` returns an error — `*sql.Tx` is not wired, [transactions](#transactions) go through `Transaction`. Also implements this package's `BatchExecer` (via `(*sql.Conn).Raw`) |
-| `driver.Validator` | retires connections broken mid-statement, and connections to a member that left the rotation, before the pool reuses them |
-| `driver.SessionResetter` | turns down an idle connection whose member left the rotation while it sat in the pool, so `database/sql` closes it and uses another |
+| `driver.Validator` | retires connections broken mid-statement, connections to a member that left the rotation, and connections that come back with a transaction open, before the pool reuses them |
+| `driver.SessionResetter` | before the pool hands an idle connection out: turns down one whose member left the rotation, or that the server closed while it sat idle, so `database/sql` closes it and uses another; and puts back what the connection's last borrower changed — the pool's database, a scan budget, a consistency override |
 | `driver.NamedValueChecker` | accepts any Go value so slices and maps can reach the typed path |
 | `driver.QueryerContext`, `driver.ExecerContext` | the main statement path |
 | `driver.Stmt`, `driver.StmtQueryContext`, `driver.StmtExecContext` | `*sql.Stmt` goes through the same server-prepared, typed path as `db.Exec` with arguments |
@@ -1160,8 +1160,10 @@ More: [docs/errors.md](docs/errors.md).
   seed list). Multiple result sets, `RETURNING` and transactions are server
   features the driver merely passes through; a `COMMIT` refused with a
   conflict — what `ErrTransactionConflict` matches and `Transaction` runs
-  again on — comes from a standalone server ≥ 0.346.0. Developed against
-  skaidb 0.290.
+  again on — comes from a standalone server ≥ 0.346.0. Clearing a
+  borrower's `SET CONSISTENCY` override takes `SET CONSISTENCY DEFAULT`
+  (server ≥ 0.349); on an older server the connection that carried one is
+  closed instead of reused. Developed against skaidb 0.290.
 - The version the driver reports in Hello is [`Version()`](#version), always
   equal to the module version in your `go.mod`.
 
