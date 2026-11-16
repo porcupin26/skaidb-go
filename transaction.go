@@ -125,7 +125,14 @@ func newTxConfig(opts []TxOption) (txConfig, error) {
 // read what it needs inside the transaction, and do nothing outside the
 // database that a second run would do twice. A value it computes is the
 // caller's to capture, as left above; after a retry it holds what the last
-// run set. Close every *sql.Rows body opens before it returns.
+// run set.
+//
+// Close every *sql.Rows body opens before it returns. A streamed result
+// (WithStreaming) keeps the connection to itself until it is closed, so
+// with one left open neither COMMIT nor ROLLBACK can be sent: the
+// transaction is ended the only way left — its connection is closed, which
+// makes the server drop it — and body's error is returned, or the "busy
+// streaming" one when body returned nil. Nothing was committed.
 //
 // A transport failure or an expired context anywhere is the usual error for
 // it and is not retried. If body panics, ROLLBACK is sent before the panic
@@ -147,7 +154,7 @@ func Transaction(ctx context.Context, db *sql.DB, body func(conn *sql.Conn) erro
 	var c *sql.Conn
 	defer func() {
 		if c != nil {
-			c.Close()
+			release(c)
 		}
 	}()
 	return runTransaction(ctx, func() (*sql.Conn, error) {
@@ -164,6 +171,20 @@ func Transaction(ctx context.Context, db *sql.DB, body func(conn *sql.Conn) erro
 		c, err = beginPooled(ctx, db, cfg.begin)
 		return c, err
 	}, body, cfg)
+}
+
+// release puts Transaction's connection back in the pool.
+//
+// (*sql.Conn).Close waits for every *sql.Rows opened on the connection to be
+// closed. After a body that left a streamed one open that is not the
+// caller's wait: the transaction is over and the connection retired
+// (runBody), and the pool drops it whenever the rows are closed.
+func release(c *sql.Conn) {
+	if dc := driverConn(c); dc != nil && dc.streaming.Load() {
+		go c.Close()
+		return
+	}
+	c.Close()
 }
 
 // beginPooled takes a connection from the pool and opens the transaction on
@@ -242,7 +263,7 @@ func runTransaction(ctx context.Context, begin func() (*sql.Conn, error), body f
 			return err
 		}
 		dc := driverConn(c)
-		if err := runBody(ctx, c, body); err != nil {
+		if err := runBody(ctx, c, dc, body); err != nil {
 			return err
 		}
 		if dc != nil && dc.broken.Load() {
@@ -273,7 +294,7 @@ var errNotCommitted = fmt.Errorf("skaidb: transaction not committed: its connect
 
 // driverConn is the driver's connection under c: nil for a *sql.Conn that is
 // closed or another driver's. Outside Raw only what any goroutine may touch
-// is used of it: its atomic flags.
+// is used of it: its atomic flags, and retire.
 func driverConn(c *sql.Conn) *conn {
 	var dc *conn
 	_ = c.Raw(func(driverConn any) error {
@@ -285,9 +306,25 @@ func driverConn(c *sql.Conn) *conn {
 
 // runBody runs body and rolls the transaction back when it does not return
 // nil: an error, a panic, or runtime.Goexit (a t.Fatal inside body).
-func runBody(ctx context.Context, c *sql.Conn, body func(*sql.Conn) error) (err error) {
+//
+// A body that leaves a streamed result open leaves no way to do either: the
+// connection is busy until those rows are closed, and a COMMIT or ROLLBACK
+// would be refused before it was sent. The transaction would stay open on
+// the server, on a live socket, and whatever ran on the connection once the
+// rows were closed — the caller's next statement, or the pool's next user —
+// would run inside it and never be committed. So the connection is retired
+// instead: its socket closes, and the server ends the transaction with the
+// session.
+func runBody(ctx context.Context, c *sql.Conn, dc *conn, body func(*sql.Conn) error) (err error) {
 	returned := false
 	defer func() {
+		if dc != nil && dc.streaming.Load() {
+			dc.retire()
+			if err == nil && returned {
+				err = errStreamLeftOpen
+			}
+			return
+		}
 		if err != nil || !returned {
 			rollback(ctx, c)
 		}
@@ -296,6 +333,11 @@ func runBody(ctx context.Context, c *sql.Conn, body func(*sql.Conn) error) (err 
 	returned = true
 	return err
 }
+
+// errStreamLeftOpen is Transaction's error when body returned nil with a
+// streamed result still open: the error its COMMIT would have met, and what
+// became of the transaction.
+var errStreamLeftOpen = fmt.Errorf("%w (the transaction's function left them open: its connection was closed to end the transaction, and nothing was committed)", errStreamBusy)
 
 // rollbackTimeout bounds the ROLLBACK that follows a failed body. A var so
 // the tests can shorten it.

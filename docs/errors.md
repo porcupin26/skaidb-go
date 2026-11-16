@@ -65,6 +65,7 @@ messages below are stable within the 1.x line.
 | `skaidb: transactions are not supported` | `Begin`/`BeginTx`: `*sql.Tx` is not wired — use `skaidb.Transaction` |
 | `skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow` | `Result.LastInsertId` |
 | `skaidb: connection is busy streaming a result set — close those rows before running another statement` | a second statement on a `*sql.Conn` whose streamed rows are still open |
+| `skaidb: connection is busy streaming a result set — close those rows before running another statement (the transaction's function left them open: its connection was closed to end the transaction, and nothing was committed)` | `Transaction`/`TransactionConn` whose function returned `nil` with a streamed result still open; when the function returned an error, that error is returned instead and the transaction ends the same way |
 | `skaidb: connection closed` | a statement on a `*sql.Conn` after `Close` |
 | `skaidb: connection is retired: an earlier statement on it failed or was cancelled part-way and its socket is closed — nothing was sent` | a statement on a `*sql.Conn` whose connection the driver has retired (see below); close the `*sql.Conn` and take another |
 

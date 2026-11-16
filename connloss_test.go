@@ -752,3 +752,129 @@ func TestATransactionWhoseCommitCannotBeWrittenWasNotCommitted(t *testing.T) {
 	}
 	l.wantReceived([]string{"BEGIN", updateSQL})
 }
+
+// ---- a stream the transaction's function left open --------------------------
+
+const scan = "SELECT id FROM big"
+
+// leavesAStream is a transaction function that opens a streamed result,
+// reads one row of it and returns result without closing it. The rows go to
+// left, for the test to close when it chooses.
+func leavesAStream(ctx context.Context, left chan<- *sql.Rows, result func() error) func(*sql.Conn) error {
+	return func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, updateSQL); err != nil {
+			return err
+		}
+		rows, err := conn.QueryContext(WithStreaming(ctx), scan)
+		if err != nil {
+			return err
+		}
+		rows.Next()
+		left <- rows
+		return result()
+	}
+}
+
+// streamServer answers scan with a short stream — all of it sent at once, so
+// what the function does not read is there to be drained — and everything
+// else with a success.
+func streamServer(t *testing.T) (*lossy, *sql.DB) {
+	stream := append(append(headerFrame("id"), chunkFrame(1, 2)...), endFrame()...)
+	return lossyServer(t, func(_ int, sql string) []byte {
+		if sql == scan {
+			return stream
+		}
+		return nil
+	})
+}
+
+// A connection that is streaming a result takes no other statement, so
+// neither COMMIT nor ROLLBACK can be sent while the function's stream is
+// open. Left at that, the transaction stays open on the server, on a live
+// socket: once the rows are closed the connection is back in the pool, and
+// whatever runs on it next runs inside the abandoned transaction, never to
+// be committed. So the connection is closed instead — the server ends the
+// transaction with the session — and the caller is told: the function's own
+// error, or the busy-streaming one. Transaction does not wait for the rows
+// to be closed either; the connection leaves the pool when they are.
+func TestATransactionThatLeavesAStreamOpenIsNotJoinable(t *testing.T) {
+	ctx := context.Background()
+	failed := errors.New("insufficient funds")
+	for _, tc := range []struct {
+		name   string
+		result func() error
+		want   error
+	}{
+		{"the function returns nil", func() error { return nil }, errStreamBusy},
+		{"the function returns an error", func() error { return failed }, failed},
+		{"the function panics", func() error { panic(failed) }, failed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			l, db := streamServer(t)
+			left := make(chan *sql.Rows, 1)
+			done := make(chan error, 1)
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						done <- r.(error)
+					}
+				}()
+				done <- Transaction(ctx, db, leavesAStream(ctx, left, tc.result))
+			}()
+			rows := <-left
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(2 * time.Second):
+				t.Error("Transaction is waiting for the function's rows to be closed")
+				rows.Close()
+				err = <-done
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+			if !l.goneSoon(0) {
+				t.Error("the connection is still open on the server, and its transaction with it")
+			}
+			// The pool's next statement is not the abandoned transaction's.
+			if _, err := db.ExecContext(ctx, "DELETE FROM audit"); err != nil {
+				t.Fatalf("an ordinary statement afterwards: %v", err)
+			}
+			l.wantReceived([]string{"BEGIN", updateSQL, scan}, []string{"DELETE FROM audit"})
+			// Closing the rows is all it takes for the pool to drop the
+			// transaction's connection.
+			rows.Close()
+			waitFor(t, "the pool to drop the transaction's connection", func() bool {
+				return db.Stats().OpenConnections == 1
+			})
+		})
+	}
+}
+
+// The same on a connection the caller holds: it is retired, so that what the
+// caller sends on it once the rows are closed is refused rather than run
+// inside the transaction it believes is over.
+func TestATransactionConnThatLeavesAStreamOpenRetiresTheConnection(t *testing.T) {
+	l, db := streamServer(t)
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := make(chan *sql.Rows, 1)
+	err = TransactionConn(ctx, conn, leavesAStream(ctx, left, func() error { return nil }))
+	if !errors.Is(err, errStreamBusy) {
+		t.Errorf("err = %v, want the busy-streaming error", err)
+	}
+	if !l.goneSoon(0) {
+		t.Error("the connection is still open on the server, and its transaction with it")
+	}
+	(<-left).Close()
+	if _, err := conn.ExecContext(ctx, "DELETE FROM audit"); !errors.Is(err, errRetired) {
+		t.Errorf("a statement on the connection afterwards: err = %v, want the retired-connection error", err)
+	}
+	l.wantReceived([]string{"BEGIN", updateSQL, scan})
+	if err := conn.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}

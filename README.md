@@ -651,7 +651,14 @@ statement, at once and on the same connection, up to three runs in all.
   what it needs inside the transaction, and do nothing outside the database
   that a second run would do twice. A value it computes is yours to
   capture, as `left` above; after a retry it holds what the last run set.
-  Close every `*sql.Rows` before returning.
+- **Close every `*sql.Rows` before returning.** A
+  [streamed](#streaming-large-results) result keeps the connection to
+  itself until it is closed, so with one left open neither `COMMIT` nor
+  `ROLLBACK` can be sent. The transaction is then ended the only way left:
+  its connection is closed, which makes the server drop it, and the
+  function's error is returned — or the "busy streaming" one when it
+  returned `nil`. Nothing was committed; a `*sql.Conn` given to
+  `TransactionConn` is retired with it.
 - **If the opening statement fails**, its error is returned, the function
   does not run and nothing else is sent. A pooled connection that turns out
   to be dead — the server restarted while it sat idle — is not such a
@@ -723,7 +730,11 @@ if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 ```
 
 A statement that fails inside a transaction does not end it: the
-transaction stays open until `COMMIT` or `ROLLBACK`. `database/sql`'s own
+transaction stays open until `COMMIT` or `ROLLBACK`. By hand, close a
+streamed result before either: while its rows are open the connection
+refuses the statement (`skaidb: connection is busy streaming …`), nothing
+was sent and the transaction is still open — close the rows and send it
+again. `database/sql`'s own
 `db.Begin()` / `db.BeginTx()` are not wired to any of this and return
 `skaidb: transactions are not supported`.
 
