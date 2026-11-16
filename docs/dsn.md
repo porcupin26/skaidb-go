@@ -83,7 +83,10 @@ table names resolve in the server's default database; you can also qualify
 names (`app.users`) in the SQL.
 
 The path is the way to select the pool's database. A `USE` statement is
-the session's — one connection's:
+the session's — one connection's. The driver notes one the server accepted
+when the statement is exactly `USE [DATABASE] <name>` — the name bare or in
+double quotes, an optional trailing `;`, `--` comments allowed — and from
+then on knows the connection is no longer in the DSN's database:
 
 - on a `*sql.Conn` it holds for as long as you keep that `*sql.Conn`. When
   the connection goes back to the pool, the driver enters the DSN's

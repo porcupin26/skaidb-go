@@ -433,12 +433,31 @@ func (c *conn) noteUse(sqlText string) {
 
 // parseUse reads sqlText as exactly one `USE [DATABASE] <name>` statement:
 // the name bare (letters, digits, underscores) or in double quotes with ""
-// for a quote inside, and an optional trailing semicolon. Anything else — a
-// comment, a second statement, a name it cannot read — is not a USE as far
-// as the driver is concerned.
+// for a quote inside, and an optional trailing semicolon. The server skips
+// `--` comments, so they are skipped here too: `USE app -- the app database`
+// is a USE like any other. Anything else — a second statement, a name it
+// cannot read — is not a USE as far as the driver is concerned.
 func parseUse(sqlText string) (name string, ok bool) {
 	const space = " \t\r\n"
-	s := strings.TrimRight(strings.TrimLeft(sqlText, space), space)
+	// What the statement starts with, behind whitespace and comment lines:
+	// every statement the server accepts comes through here, and all but a
+	// USE leave at once.
+	s := sqlText
+	for {
+		s = strings.TrimLeft(s, space)
+		if !strings.HasPrefix(s, "--") {
+			break
+		}
+		end := strings.IndexByte(s, '\n')
+		if end < 0 {
+			return "", false
+		}
+		s = s[end+1:]
+	}
+	if len(s) < 3 || !strings.EqualFold(s[:3], "USE") {
+		return "", false
+	}
+	s = strings.TrimRight(withoutLineComments(s), space)
 	s = strings.TrimRight(strings.TrimSuffix(s, ";"), space)
 	// word cuts keyword off the front of s: a whole word, so followed by
 	// the end, a space or an opening quote.
@@ -485,6 +504,38 @@ func parseUse(sqlText string) (name string, ok bool) {
 		}
 	}
 	return "", false
+}
+
+// withoutLineComments is sqlText without its `--` comments, each of which
+// runs to the end of its line. A `--` inside a double-quoted name or a
+// single-quoted string is not a comment: `USE "a--b"` names the database
+// a--b.
+func withoutLineComments(sqlText string) string {
+	if !strings.Contains(sqlText, "--") {
+		return sqlText
+	}
+	var b strings.Builder
+	var quote byte // the quote a name or string is open in; 0 outside one
+	for i := 0; i < len(sqlText); i++ {
+		c := sqlText[i]
+		switch {
+		case quote != 0:
+			if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '-' && strings.HasPrefix(sqlText[i:], "--"):
+			end := strings.IndexByte(sqlText[i:], '\n')
+			if end < 0 {
+				return b.String()
+			}
+			i += end // the line break stays: it still separates words
+			c = '\n'
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
 }
 
 // roundTrip writes one request frame and reads the first frame of its
