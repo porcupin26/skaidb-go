@@ -169,6 +169,17 @@ func TestABorrowersUseDoesNotOutliveItsBorrow(t *testing.T) {
 			}
 			return []string{use}
 		},
+		// Pasted from a document, the spaces are not always U+0020. The
+		// server takes any Unicode space, a vertical tab and a form feed
+		// for whitespace, so the session moves — and the driver has to see
+		// that it did.
+		"with a no-break space in it": func(t *testing.T, db *sql.DB) []string {
+			const use = "USE\u00a0other"
+			if _, err := db.ExecContext(ctx, use); err != nil {
+				t.Fatal(err)
+			}
+			return []string{use}
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := fakeMembers(t, "a")[0]
@@ -299,7 +310,9 @@ func TestAConnectionThatCannotGoBackToTheDefaultDatabaseIsDropped(t *testing.T) 
 // What the driver reads as a USE: exactly one `USE [DATABASE] <name>`, the
 // name bare or in double quotes with "" for a quote inside, an optional
 // trailing semicolon — and `--` comments, which the server skips to the end
-// of their line, outside a quoted name. Anything else is left alone.
+// of their line, outside a quoted name. Whitespace is what the server takes
+// for it: the ASCII blanks, vertical tab and form feed included, and every
+// Unicode space. Anything else is left alone.
 func TestParseUse(t *testing.T) {
 	for sql, want := range map[string]string{
 		"USE app":                          "app",
@@ -371,8 +384,18 @@ func TestParseUse(t *testing.T) {
 		"USE \"\"\"\"":                     `"`,
 		"USE app ; ":                       "app",
 		"\ufeffUSE app":                    "",
-		"USE\u00a0app":                     "",
-		"USE app\u00a0":                    "",
+		"USE\u00a0app":                     "app",
+		"USE app\u00a0":                    "app",
+		"\u00a0USE app":                    "app",
+		"USE\vapp":                         "app",
+		"USE\fapp":                         "app",
+		"USE\u3000app":                     "app",
+		"USE\u0085app\u2003;\u00a0":        "app",
+		"USE\u2003DATABASE\u00a0app":       "app",
+		"USE\u00a0\"app\"\u00a0;":          "app",
+		"USE\u00a0-- which\n\u00a0app":     "app",
+		"USE app\u200b":                    "",
+		"USE app\u00a0other":               "",
 		"USE \"app\" ; x":                  "",
 		"USE \"unterminated\"\"":           "",
 		"USE database \"\"":                "",

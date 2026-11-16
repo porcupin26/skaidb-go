@@ -45,6 +45,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 func init() { sql.Register("skaidb", &drv{}) }
@@ -451,61 +452,96 @@ func (c *conn) noteUse(sqlText string) {
 
 // parseUse reads sqlText as exactly one `USE [DATABASE] <name>` statement:
 // the name bare (letters, digits, underscores) or in double quotes with ""
-// for a quote inside, and an optional trailing semicolon. The server skips
-// `--` comments, so they are skipped here too: `USE app -- the app database`
-// is a USE like any other. Anything else — a second statement, a name it
+// for a quote inside, and an optional trailing semicolon. Whitespace and
+// `--` comments are skipped as the server skips them (skipBlank), so
+// `USE app -- the app database` is a USE like any other, and so is one whose
+// blanks are not U+0020. Anything else — a second statement, a name it
 // cannot read — is not a USE as far as the driver is concerned.
 func parseUse(sqlText string) (name string, ok bool) {
-	const space = " \t\r\n"
-	// What the statement starts with, behind whitespace and comment lines:
-	// every statement the server accepts comes through here, and all but a
-	// USE leave at once.
-	s := sqlText
-	for {
-		s = strings.TrimLeft(s, space)
-		if !strings.HasPrefix(s, "--") {
-			break
-		}
-		end := strings.IndexByte(s, '\n')
-		if end < 0 {
-			return "", false
-		}
-		s = s[end+1:]
-	}
-	if len(s) < 3 || !strings.EqualFold(s[:3], "USE") {
+	// Every statement the server accepts comes through here, and all but a
+	// USE leave at their first word.
+	first, rest, ok := sqlWord(skipBlank(sqlText))
+	if !ok || !strings.EqualFold(first, "USE") {
 		return "", false
 	}
-	s = strings.TrimRight(withoutLineComments(s), space)
-	s = strings.TrimRight(strings.TrimSuffix(s, ";"), space)
-	// word cuts keyword off the front of s: a whole word, so followed by
-	// the end, a space or an opening quote.
-	word := func(s, keyword string) (string, bool) {
-		if len(s) < len(keyword) || !strings.EqualFold(s[:len(keyword)], keyword) {
-			return s, false
+	rest = skipBlank(rest)
+	// DATABASE is the optional keyword only when a name follows it; alone,
+	// it is the name.
+	if word, after, ok := sqlWord(rest); ok && strings.EqualFold(word, "DATABASE") {
+		if after = skipBlank(after); after != "" && after[0] != ';' {
+			rest = after
 		}
-		rest := s[len(keyword):]
-		if rest != "" && !strings.ContainsRune(space+`"`, rune(rest[0])) {
-			return s, false
-		}
-		return strings.TrimLeft(rest, space), true
 	}
-	s, ok = word(s, "USE")
+	if strings.HasPrefix(rest, `"`) {
+		name, rest, ok = quotedName(rest)
+	} else {
+		name, rest, ok = sqlWord(rest)
+	}
 	if !ok {
 		return "", false
 	}
-	// DATABASE is the optional keyword only when a name follows it;
-	// alone, it is the name.
-	if rest, ok := word(s, "DATABASE"); ok && rest != "" {
-		s = rest
+	// The statement ends here, behind one semicolon at most, or it is not
+	// one the driver reads.
+	if skipBlank(strings.TrimPrefix(skipBlank(rest), ";")) != "" {
+		return "", false
 	}
-	if !strings.HasPrefix(s, `"`) {
-		for _, r := range s {
-			if r != '_' && !unicode.IsLetter(r) && !unicode.IsDigit(r) {
-				return "", false
+	return name, true
+}
+
+// skipBlank drops from the front of s what the server skips between two
+// tokens: whitespace — the ASCII blanks, vertical tab and form feed
+// included, and every Unicode space (a no-break space pasted in with the
+// statement is one) — and `--` comments, each to the end of its line.
+func skipBlank(s string) string {
+	for s != "" {
+		switch c := s[0]; {
+		case c == ' ' || '\t' <= c && c <= '\r':
+			s = s[1:]
+		case c == '-' && strings.HasPrefix(s, "--"):
+			end := strings.IndexByte(s, '\n')
+			if end < 0 {
+				return ""
 			}
+			s = s[end+1:]
+		case c >= utf8.RuneSelf:
+			r, size := utf8.DecodeRuneInString(s)
+			if !unicode.IsSpace(r) {
+				return s
+			}
+			s = s[size:]
+		default:
+			return s
 		}
-		return s, s != ""
 	}
+	return s
+}
+
+// sqlWord cuts a bare word — a keyword, or a name written without quotes —
+// off the front of s: letters, digits and underscores, the letters and
+// digits of any script.
+func sqlWord(s string) (word, rest string, ok bool) {
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c < utf8.RuneSelf {
+			if c != '_' && !('a' <= c|0x20 && c|0x20 <= 'z') && !('0' <= c && c <= '9') {
+				break
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if !unicode.IsLetter(r) && !unicode.IsNumber(r) && !unicode.Is(unicode.Other_Alphabetic, r) {
+			break
+		}
+		i += size
+	}
+	return s[:i], s[i:], i > 0
+}
+
+// quotedName cuts a name in double quotes off the front of s, which starts
+// at the opening quote; "" inside stands for one quote.
+func quotedName(s string) (name, rest string, ok bool) {
 	var b strings.Builder
 	for i := 1; i < len(s); i++ {
 		switch {
@@ -514,46 +550,11 @@ func parseUse(sqlText string) (name string, ok bool) {
 		case i+1 < len(s) && s[i+1] == '"':
 			b.WriteByte('"')
 			i++
-		default: // the closing quote: the statement ends here, or it is not one
-			if i != len(s)-1 || b.Len() == 0 {
-				return "", false
-			}
-			return b.String(), true
+		default: // the closing quote
+			return b.String(), s[i+1:], b.Len() > 0
 		}
 	}
-	return "", false
-}
-
-// withoutLineComments is sqlText without its `--` comments, each of which
-// runs to the end of its line. A `--` inside a double-quoted name or a
-// single-quoted string is not a comment: `USE "a--b"` names the database
-// a--b.
-func withoutLineComments(sqlText string) string {
-	if !strings.Contains(sqlText, "--") {
-		return sqlText
-	}
-	var b strings.Builder
-	var quote byte // the quote a name or string is open in; 0 outside one
-	for i := 0; i < len(sqlText); i++ {
-		c := sqlText[i]
-		switch {
-		case quote != 0:
-			if c == quote {
-				quote = 0
-			}
-		case c == '"' || c == '\'':
-			quote = c
-		case c == '-' && strings.HasPrefix(sqlText[i:], "--"):
-			end := strings.IndexByte(sqlText[i:], '\n')
-			if end < 0 {
-				return b.String()
-			}
-			i += end // the line break stays: it still separates words
-			c = '\n'
-		}
-		b.WriteByte(c)
-	}
-	return b.String()
+	return "", "", false
 }
 
 // roundTrip writes one request frame and reads the first frame of its

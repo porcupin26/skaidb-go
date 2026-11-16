@@ -87,8 +87,9 @@ as you hold it. A `USE` statement is the session's — one connection's — and
 every pooled connection reaches its next borrower in the pool's database.
 The driver notes a `USE` the server accepted when the statement is exactly
 `USE [DATABASE] <name>` — the name bare or in double quotes, an optional
-trailing `;`, `--` comments allowed — and from then on knows the connection
-is no longer in the pool's database:
+trailing `;`, `--` comments allowed, the words apart by any whitespace the
+server takes (a no-break space is one) — and from then on knows the
+connection is no longer in the pool's database:
 
 - on a `*sql.Conn` it holds for as long as you keep that `*sql.Conn`. When
   the connection goes back to the pool, the driver enters the pool's
