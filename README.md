@@ -1065,7 +1065,7 @@ context errors, `driver.ErrBadConn` — and this package's
 | `db.Begin` / `db.BeginTx` | `skaidb: transactions are not supported` — `*sql.Tx` is not wired; use [`Transaction`](#transactions) |
 | `LastInsertId` | `skaidb: no LastInsertId — use INSERT … RETURNING id with QueryRow` |
 | second statement during a stream on the same `*sql.Conn` | `skaidb: connection is busy streaming a result set — close those rows before running another statement` |
-| connection lost before the request was written | `driver.ErrBadConn` (retried by `database/sql` on another connection; never visible to you unless every retry fails) |
+| connection lost before the request was written, or while a statement with arguments was being prepared | `driver.ErrBadConn` (retried by `database/sql` on another connection; never visible to you unless every retry fails) |
 | connection lost after the request was written | `skaidb: connection lost mid-statement (statement may or may not have applied): <io error>` — the write's fate is unknown; the driver does not retry |
 | deadline / cancellation | `context.DeadlineExceeded` / `context.Canceled` (via `errors.Is`) |
 | a statement on a `*sql.Conn` whose connection was retired by an earlier failure | `skaidb: connection is retired: an earlier statement on it failed or was cancelled part-way and its socket is closed — nothing was sent` |

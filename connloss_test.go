@@ -34,6 +34,10 @@ type lossy struct {
 	ln    net.Listener
 	reply func(conn int, sql string) []byte
 
+	// The connection whose next OP_PREPARE is answered with a closed socket;
+	// -1 for none.
+	dropPrepare atomic.Int64
+
 	mu       sync.Mutex
 	accepted chan struct{}
 	clients  []*conn         // the driver's end of each connection
@@ -51,6 +55,7 @@ func lossyServer(t *testing.T, reply func(conn int, sql string) []byte) (*lossy,
 		reply = func(int, string) []byte { return nil }
 	}
 	l := &lossy{t: t, ln: ln, reply: reply, accepted: make(chan struct{}, 64)}
+	l.dropPrepare.Store(-1)
 	go l.accept()
 	db := sql.OpenDB(l)
 	t.Cleanup(func() {
@@ -102,13 +107,16 @@ func (l *lossy) serve(n int, s net.Conn) {
 		case 1, 5: // OP_QUERY, OP_QUERY_STREAM
 			text = string(req[6:])
 		case 2: // OP_PREPARE
+			if l.dropPrepare.CompareAndSwap(int64(n), -1) {
+				return
+			}
 			prepared = append(prepared, string(req[5:]))
 			f := preparedFrame(uint32(len(prepared)), uint16(strings.Count(string(req[5:]), "?")))
 			if _, err := s.Write(f); err != nil {
 				return
 			}
 			continue
-		case 3: // OP_EXECUTE
+		case 3, 7: // OP_EXECUTE, OP_EXECUTE_BATCH
 			text = prepared[binary.LittleEndian.Uint32(req[2:])-1]
 		default:
 			if _, err := s.Write(errorFrame("unexpected request")); err != nil {
@@ -876,5 +884,58 @@ func TestATransactionConnThatLeavesAStreamOpenRetiresTheConnection(t *testing.T)
 	l.wantReceived([]string{"BEGIN", updateSQL, scan})
 	if err := conn.Close(); err != nil {
 		t.Errorf("Close: %v", err)
+	}
+}
+
+// ---- a statement with arguments on a dead pooled connection -----------------
+
+// A statement with arguments is prepared on its connection first. When that
+// round trip fails, nothing has run — a PREPARE executes nothing — so the
+// statement is database/sql's to run on another connection, like one whose
+// own request could not be written, and the dead connection leaves the
+// pool. Reported as the raw socket error instead, the statement failed and
+// the connection went back to the pool for the next statement to fail on.
+func TestAStatementWithArgumentsMovesOffADeadPooledConnection(t *testing.T) {
+	const insert = "INSERT INTO t (id) VALUES (?)"
+	ctx := context.Background()
+	for name, lose := range map[string]func(l *lossy){
+		"the prepare cannot be written": func(l *lossy) { l.kill(0) },
+		"the prepare's reply is lost":   func(l *lossy) { l.dropPrepare.Store(0) },
+	} {
+		for kind, run := range map[string]func(db *sql.DB) error{
+			"Exec": func(db *sql.DB) error {
+				_, err := db.ExecContext(ctx, insert, 1)
+				return err
+			},
+			"Query": func(db *sql.DB) error {
+				rows, err := db.QueryContext(ctx, insert, 1)
+				if err == nil {
+					rows.Close()
+				}
+				return err
+			},
+			"ExecBatch": func(db *sql.DB) error {
+				_, err := ExecBatch(ctx, db, insert, [][]any{{1}, {2}})
+				return err
+			},
+		} {
+			t.Run(name+", "+kind, func(t *testing.T) {
+				l, db := lossyServer(t, nil)
+				if _, err := db.ExecContext(ctx, "DELETE FROM warm"); err != nil {
+					t.Fatal(err)
+				}
+				lose(l)
+				if err := run(db); err != nil {
+					t.Fatalf("on a pool whose idle connection is dead: %v", err)
+				}
+				l.wantReceived([]string{"DELETE FROM warm"}, []string{insert})
+				if c := l.client(0); c.IsValid() || !socketClosed(c) {
+					t.Error("the dead connection was not retired")
+				}
+				if s := db.Stats(); s.OpenConnections != 1 || s.InUse != 0 {
+					t.Errorf("pool: %d open, %d in use; want the new connection alone, idle", s.OpenConnections, s.InUse)
+				}
+			})
+		}
 	}
 }

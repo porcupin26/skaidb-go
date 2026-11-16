@@ -1262,7 +1262,10 @@ func (c *conn) prepareServer(sqlText string) (uint32, int, bool, error) {
 	req = append(req, body...)
 	frame, _, err := c.roundTrip(req)
 	if err != nil {
-		return 0, 0, false, err
+		// Nothing ran: a PREPARE executes nothing, so wherever its round
+		// trip failed the statement is safe to run on another connection —
+		// driver.ErrBadConn, even when the request was written.
+		return 0, 0, false, c.transportErr(err, false)
 	}
 	r := &reader{buf: frame}
 	switch r.u8() {
