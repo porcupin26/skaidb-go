@@ -124,6 +124,11 @@ func TestApplyContextBackgroundLeavesConnUsable(t *testing.T) {
 // preAnswered is a fake server whose n answers are in the client's receive
 // buffer before the first request is written, so a statement runs from start
 // to finish without its goroutine ever waiting on the socket.
+//
+// No server answers ahead of the question: bytes waiting on an idle
+// connection are what the driver takes for a connection out of step
+// (closedWhileIdle), and rightly. So the socket is handed to the conn behind
+// a plain net.Conn, which cannot be looked at.
 func preAnswered(t *testing.T, n int) *conn {
 	t.Helper()
 	sent := make(chan struct{})
@@ -134,6 +139,7 @@ func preAnswered(t *testing.T, n int) *conn {
 		close(sent)
 		io.Copy(io.Discard, s)
 	})
+	c.nc = struct{ net.Conn }{c.nc}
 	<-sent
 	time.Sleep(20 * time.Millisecond)
 	return c

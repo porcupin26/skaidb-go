@@ -51,6 +51,7 @@ type fakeMember struct {
 	mu      sync.Mutex
 	listing func() []listedEndpoint
 	stmts   [][]string // statements received, per connection in accept order
+	socks   []net.Conn // the member's end of each connection, in accept order
 }
 
 // received is what each connection sent the member, in accept order.
@@ -62,6 +63,17 @@ func (m *fakeMember) received() [][]string {
 		out[i] = append([]string(nil), c...)
 	}
 	return out
+}
+
+// hangUp closes the member's end of every connection it has, as a restart
+// or an idle timeout does, and gives the close time to arrive.
+func (m *fakeMember) hangUp() {
+	m.mu.Lock()
+	for _, s := range m.socks {
+		s.Close()
+	}
+	m.mu.Unlock()
+	time.Sleep(100 * time.Millisecond)
 }
 
 func newFakeMember(t *testing.T, v *vectors, name string) *fakeMember {
@@ -99,6 +111,7 @@ func (m *fakeMember) accept() {
 		m.mu.Lock()
 		n := len(m.stmts)
 		m.stmts = append(m.stmts, nil)
+		m.socks = append(m.socks, s)
 		m.mu.Unlock()
 		go func() {
 			defer s.Close()

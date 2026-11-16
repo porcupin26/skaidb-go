@@ -136,7 +136,9 @@ transaction every statement commits on its own.
 
 Checks out a connection, dialling one if the pool is empty. There is no
 lighter server round-trip; the dial itself (TCP, TLS, SCRAM, `USE`) is the
-meaningful health check.
+meaningful health check. An idle connection the server has closed
+meanwhile is not checked out: the driver looks at its socket, drops it, and
+the pool dials.
 
 ## Consistency per statement
 

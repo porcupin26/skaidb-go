@@ -911,6 +911,19 @@ the request had **not** reached the wire, the driver returns
 connection transparently; when it had, the error is surfaced (see
 [Errors](#errors)) because a retry could double-apply a write.
 
+A connection the server closed while it sat idle — a member restart, a
+failover, an idle timeout — costs no statement. The driver looks at the
+socket before it writes a request and before the pool hands the connection
+out: one non-blocking read, no round trip (under TLS, of the socket
+itself). A connection found closed, reset, or holding bytes no request
+asked for is dropped with nothing sent, so the statement runs on another
+connection, and `db.Conn` gives a connection that works; nothing counts
+against the member. On a `*sql.Conn` you already hold, the statement fails
+with `driver.ErrBadConn` — nothing was sent — and inside a transaction
+that is a lost transaction, as any connection loss is. The look is made on
+Linux, macOS, the BSDs and Solaris; elsewhere such a connection is found
+by the statement's own write or read.
+
 ### Balancing across members
 
 The connector spreads the pool's connections across the cluster's members by
@@ -942,7 +955,7 @@ The same through the DSN alone:
 | `load_balancing` / `LoadBalancing` | `random` | `random`: a new connection dials the usable members in random order and stays on the one it reached. `round_robin`: new connections go to the usable members in turn, in endpoint order. `least_latency`: of two usable members picked at random, the one with the lower round-trip average × (open connections + 1); a member not measured in the last 2 s scores 0, so it is tried and a quiet pool keeps re-measuring every member. |
 | `discover` / `Discover` | off | Reads the members with `SHOW ENDPOINTS` (server ≥ 0.327; no privilege needed) on the first connection to each member not yet named, and every `refresh_interval` after (every 5 s while a member is `resyncing` or `unreachable`). New members are added, members that left are dropped (a seed is kept, marked `unlisted`), and only `ready` members get new connections; a member back to `ready` starts with a fresh average. A seed given as a host name is matched to the endpoint the server reports. A standalone server (no rows) or an older one (an error) leaves the seeds as they are, and the connector stops asking. |
 | `refresh_interval` / `RefreshInterval` | 60 s | How often discovery re-reads the members. |
-| `eject_errors` / `EjectErrors` | 3 | Consecutive transport failures that eject a member: a failed dial, an I/O error or a deadline mid-statement, a capacity refusal. Statement errors, refused logins, a cancelled context and this side's problems (an unreadable TLS file, a session database the server refuses) do not count. |
+| `eject_errors` / `EjectErrors` | 3 | Consecutive transport failures that eject a member: a failed dial, an I/O error or a deadline mid-statement, a capacity refusal. Statement errors, refused logins, a cancelled context, a connection found closed after it sat idle and this side's problems (an unreadable TLS file, a session database the server refuses) do not count. |
 | `eject_latency_factor`, `eject_latency_floor` / `EjectLatencyFactor`, `EjectLatencyFloor` | 3, 50 ms | With at least 10 round trips on it and on another usable member, a member whose average is above factor × the other usable members' median **and** more than floor above it is ejected. The fastest of a member's first three round trips seeds its average, so a statement that stalls in your own process — a CPU-bound start-up — cannot get a healthy member ejected; the warning names the average, the median and the slowest of the member's last 10 round trips. Factor 0 disables. |
 | `eject_backoff`, `eject_backoff_max` / `EjectBackoff`, `EjectBackoffMax` | 5 s, 60 s | How long an ejection lasts, doubled per repeat up to the max; a member healthy for the max after a re-admission starts over. When it is up, a background goroutine dials the member alone and runs one statement: success re-admits it with a fresh average, failure ejects it again. **The last usable member is never ejected.** |
 

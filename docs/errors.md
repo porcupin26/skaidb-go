@@ -74,7 +74,7 @@ messages below are stable within the 1.x line.
 
 | Situation | What you get | Retry? |
 |---|---|---|
-| the socket failed **before** the request was written, or while a statement with arguments was being prepared (nothing has run yet) | nothing: the driver returns `driver.ErrBadConn`, `database/sql` discards the connection and re-runs the statement on a fresh one (up to its internal limit), transparently | already done |
+| the server closed the connection while it sat idle (the driver looks at the socket, without waiting, before each request and before each checkout), the socket failed **before** the request was written, or while a statement with arguments was being prepared (nothing has run yet) | nothing: the driver returns `driver.ErrBadConn`, `database/sql` discards the connection and re-runs the statement on a fresh one (up to its internal limit), transparently. On a `*sql.Conn` you hold there is no other connection to run it on: the statement returns `driver.ErrBadConn`, and nothing was sent | already done |
 | the socket failed before the request was written, on a `*sql.Conn` with a `*sql.Rows` still open | `skaidb: connection lost before the statement was sent: <io error>` — `database/sql` retries nothing on a `*sql.Conn`, and `driver.ErrBadConn` there would make it wait for those rows to be closed | on another connection: nothing was sent |
 | the socket failed **after** the request was written | `skaidb: connection lost mid-statement (statement may or may not have applied): <io error>` | only if idempotent |
 | the context expired / was cancelled | `context.DeadlineExceeded` / `context.Canceled` (via `errors.Is`); the connection is retired | only if idempotent |
@@ -92,7 +92,10 @@ is written, so no statement can read the reply the failed one left behind.
 A
 transport failure (or an expired deadline, not a cancellation) also counts
 against the member; enough in a row eject it for a while (see
-[dsn.md](dsn.md#load-balancing)).
+[dsn.md](dsn.md#load-balancing)). A connection found closed while it sat
+idle does not: it says that the connection ended — an idle timeout ends
+every one — and the dial that replaces it is what tells whether the member
+is there.
 
 A statement error — a transaction conflict included — is none of these: the
 connection stays in the pool and nothing counts against the member.

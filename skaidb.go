@@ -408,6 +408,12 @@ func (c *conn) ResetSession(ctx context.Context) error {
 	if !c.IsValid() {
 		return driver.ErrBadConn
 	}
+	if c.closedWhileIdle() != nil {
+		// Found before the pool hands it out: a *sql.Conn gets a connection
+		// that works, where database/sql would give it no second one.
+		c.retire()
+		return driver.ErrBadConn
+	}
 	if c.home != "" && c.database != c.home {
 		finish := c.applyContext(ctx)
 		_, err := c.exec(useSQL(c.home))
@@ -546,6 +552,9 @@ func (c *conn) roundTrip(req []byte) (frame []byte, sent bool, err error) {
 	if c.broken.Load() {
 		return nil, false, errRetired
 	}
+	if err := c.closedWhileIdle(); err != nil {
+		return nil, false, err
+	}
 	start := time.Now()
 	if err := c.writeFrame(req); err != nil {
 		c.observeFailure()
@@ -559,6 +568,40 @@ func (c *conn) roundTrip(req []byte) (frame []byte, sent bool, err error) {
 		c.lb.observe(c.member, time.Since(start))
 	}
 	return frame, true, nil
+}
+
+// closedWhileIdle looks at the socket before a request is written, and
+// reports why the connection cannot take one: the server closed it, or reset
+// it, while it sat idle — a restart, a failover, an idle timeout.
+//
+// The write alone does not tell. To a socket whose peer is gone it succeeds
+// — across a real network the reset it provokes comes back later — and only
+// the read of the answer fails, when the request has left and nobody can say
+// whether it ran: an error for the caller, once per idle connection, after
+// every restart. Seen before the write, the loss costs nothing: nothing was
+// sent, so the statement is safe to run on another connection, which is what
+// database/sql does with driver.ErrBadConn.
+//
+// The look is one non-blocking read (peerClosed): no round trip, no wait.
+// Every request starts at a frame boundary, where the server has nothing to
+// say, so it is made before each of them and when the pool is about to hand
+// the connection out (ResetSession); a stream in flight never comes through
+// here. Under TLS it is the socket that is looked at, not the decrypted
+// stream. A connection found closed is not a failure of its member: it says
+// that the connection ended, not that the member is unwell — the dial that
+// follows finds that out.
+func (c *conn) closedWhileIdle() error {
+	nc := c.nc
+	if tc, ok := nc.(*tls.Conn); ok {
+		nc = tc.NetConn()
+	}
+	err := peerClosed(nc)
+	if err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		// A deadline that has run out says nothing about the peer: the write
+		// that follows fails on it, as it did before there was a look.
+		return nil
+	}
+	return fmt.Errorf("skaidb: the server closed the connection while it was idle: %w", err)
 }
 
 // observeFailure tells the Connector a transport failure hit this

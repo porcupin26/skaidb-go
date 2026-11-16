@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -43,8 +44,11 @@ type lossy struct {
 	mu       sync.Mutex
 	accepted chan struct{}
 	clients  []*conn         // the driver's end of each connection
+	socks    []net.Conn      // the server's end of each connection
 	got      [][]string      // statements received, per connection
 	gone     []chan struct{} // closed once a connection's server end is done
+	deaf     []bool          // half-closed (halfClose): reads on, answers nothing
+	late     []int           // bytes that arrived after the half-close
 }
 
 func lossyServer(t *testing.T, reply func(conn int, sql string) []byte) (*lossy, *sql.DB) {
@@ -85,6 +89,9 @@ func (l *lossy) accept() {
 		l.mu.Lock()
 		n := len(l.got)
 		l.got = append(l.got, nil)
+		l.socks = append(l.socks, s)
+		l.deaf = append(l.deaf, false)
+		l.late = append(l.late, 0)
 		gone := make(chan struct{})
 		l.gone = append(l.gone, gone)
 		l.mu.Unlock()
@@ -103,6 +110,15 @@ func (l *lossy) serve(n int, s net.Conn) {
 		req, err := readReq(s)
 		if err != nil {
 			return
+		}
+		l.mu.Lock()
+		deaf := l.deaf[n]
+		if deaf {
+			l.late[n] += 4 + len(req)
+		}
+		l.mu.Unlock()
+		if deaf {
+			continue
 		}
 		var text string
 		switch req[0] {
@@ -167,9 +183,53 @@ func (m *mortal) Write(p []byte) (int, error) {
 	return m.Conn.Write(p)
 }
 
+// SyscallConn is the socket's own: the driver looks at the socket under a
+// mortal as it does at the *net.TCPConn it dials.
+func (m *mortal) SyscallConn() (syscall.RawConn, error) {
+	return m.Conn.(syscall.Conn).SyscallConn()
+}
+
 // kill makes connection n dead, as an idle connection is once its server
 // has restarted: nobody knows until the next write.
 func (l *lossy) kill(n int) { l.client(n).nc.(*mortal).left.Store(0) }
+
+// halfClose is what a server that went away looks like from across a real
+// network: it shuts down the sending side of connection n and no more. The
+// client reads end-of-file; its writes still succeed, because the socket
+// stays open — the server reads on, answers nothing, and counts what
+// arrives (lateBytes). On loopback a closed socket answers the next write
+// with a reset at once, which is why a plain close does not show this.
+func (l *lossy) halfClose(n int) {
+	l.t.Helper()
+	l.mu.Lock()
+	s := l.socks[n]
+	l.deaf[n] = true
+	l.mu.Unlock()
+	if err := s.(*net.TCPConn).CloseWrite(); err != nil {
+		l.t.Fatalf("half-close: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond) // the end-of-file has to arrive
+}
+
+// reset closes connection n with a reset instead of an orderly close.
+func (l *lossy) reset(n int) {
+	l.t.Helper()
+	l.mu.Lock()
+	s := l.socks[n]
+	l.mu.Unlock()
+	if err := s.(*net.TCPConn).SetLinger(0); err != nil {
+		l.t.Fatalf("SO_LINGER: %v", err)
+	}
+	s.Close()
+	time.Sleep(100 * time.Millisecond) // the reset has to arrive
+}
+
+// lateBytes is how many bytes connection n received after its half-close.
+func (l *lossy) lateBytes(n int) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.late[n]
+}
 
 // killAfter lets connection n send that many more requests, then kills it.
 func (l *lossy) killAfter(n, requests int) {
