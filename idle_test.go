@@ -218,6 +218,7 @@ func TestATransactionOpensElsewhereWhenThePooledConnectionWasClosedWhileIdle(t *
 // Nothing counts against the member: with eject_errors=1, one closed socket
 // would otherwise take a healthy member out of rotation.
 func TestAConnectionClosedWhileIdleDoesNotCountAgainstItsMember(t *testing.T) {
+	needsLook(t)
 	ms := fakeMembers(t, "a", "b")
 	c, db := lbDB(t, endpointsOf(ms), "eject_errors=1")
 	first := who(t, db)
@@ -357,6 +358,7 @@ func (m *tlsMember) received() [][]string {
 // closed meanwhile (its process gone: no TLS alert, the socket just ends)
 // costs no statement.
 func TestATLSConnectionClosedWhileIdleCostsNoStatement(t *testing.T) {
+	needsLook(t)
 	pki := newTestPKI(t, "ada")
 	m := newTLSMember(t, pki)
 	db, err := sql.Open("skaidb", "skaidb://"+m.addr+"/?auth_mechanism=certificate"+

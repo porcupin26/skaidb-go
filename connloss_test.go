@@ -201,6 +201,7 @@ func (l *lossy) kill(n int) { l.client(n).nc.(*mortal).left.Store(0) }
 // with a reset at once, which is why a plain close does not show this.
 func (l *lossy) halfClose(n int) {
 	l.t.Helper()
+	needsLook(l.t)
 	l.mu.Lock()
 	s := l.socks[n]
 	l.deaf[n] = true
@@ -214,6 +215,7 @@ func (l *lossy) halfClose(n int) {
 // reset closes connection n with a reset instead of an orderly close.
 func (l *lossy) reset(n int) {
 	l.t.Helper()
+	needsLook(l.t)
 	l.mu.Lock()
 	s := l.socks[n]
 	l.mu.Unlock()
@@ -222,6 +224,15 @@ func (l *lossy) reset(n int) {
 	}
 	s.Close()
 	time.Sleep(100 * time.Millisecond) // the reset has to arrive
+}
+
+// needsLook skips a test of a connection closed while it sat idle where the
+// driver has no way to look at a socket without waiting on it.
+func needsLook(t *testing.T) {
+	t.Helper()
+	if !canLook {
+		t.Skip("the driver does not look at idle sockets on this platform")
+	}
 }
 
 // lateBytes is how many bytes connection n received after its half-close.
