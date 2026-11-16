@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -114,6 +115,77 @@ func TestApplyContextBackgroundLeavesConnUsable(t *testing.T) {
 	}
 	if !c.IsValid() {
 		t.Fatal("an uncancelled statement must leave the connection usable")
+	}
+}
+
+// preAnswered is a fake server whose n answers are in the client's receive
+// buffer before the first request is written, so a statement runs from start
+// to finish without its goroutine ever waiting on the socket.
+func preAnswered(t *testing.T, n int) *conn {
+	t.Helper()
+	sent := make(chan struct{})
+	c := fakeServer(t, func(s net.Conn) {
+		for i := 0; i < n; i++ {
+			s.Write(mutationFrame(1))
+		}
+		close(sent)
+		io.Copy(io.Discard, s)
+	})
+	<-sent
+	time.Sleep(20 * time.Millisecond)
+	return c
+}
+
+// The goroutine that watches a statement's context is over when the
+// statement returns. One that had not reached its select yet would find the
+// context cancelled afterwards — `defer cancel()` does exactly that — and
+// mark the healthy connection broken, with a deadline in the past on its
+// socket: the next statement on a pinned *sql.Conn then fails, and a pooled
+// connection is thrown away.
+//
+// One P, and answers that are already in the socket: the statement never
+// yields, so its watcher has not run when it returns.
+func TestACancelAfterTheStatementReturnedLeavesTheConnectionAlone(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	const rounds = 200
+	c := preAnswered(t, rounds)
+	for i := 0; i < rounds; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := c.ExecContext(ctx, "DELETE FROM t", nil); err != nil {
+			t.Fatalf("statement %d: %v", i, err)
+		}
+		cancel()
+		runtime.Gosched() // a watcher that is still about runs now
+		if !c.IsValid() {
+			t.Fatalf("statement %d returned, its context was cancelled afterwards, and the connection was retired", i)
+		}
+	}
+}
+
+// The same for a context that is cancelled while the statement runs, when
+// the statement finishes all the same: the connection's fate is settled when
+// the statement returns. database/sql asks IsValid at that moment and puts
+// the connection back in the pool — a watcher still about would break it
+// there, under the next caller's statement. A statement that had finished is
+// left alone: the connection is at a frame boundary, and stays usable.
+func TestACancelWhileTheStatementFinishesIsSettledWhenItReturns(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	const rounds = 200
+	c := preAnswered(t, rounds)
+	for i := 0; i < rounds; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := c.ExecContext(ctx, "DELETE FROM t", nil); !errors.Is(err, context.Canceled) {
+			t.Fatalf("statement %d: err = %v, want context.Canceled", i, err)
+		}
+		valid := c.IsValid()
+		runtime.Gosched()
+		if c.IsValid() != valid {
+			t.Fatalf("statement %d: the connection was valid = %v when the statement returned and %v afterwards", i, valid, !valid)
+		}
+		if !valid {
+			t.Fatalf("statement %d had finished when its context was looked at, and the connection was retired", i)
+		}
 	}
 }
 

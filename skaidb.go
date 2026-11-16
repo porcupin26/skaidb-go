@@ -899,10 +899,16 @@ func (c *conn) consistencyFor(ctx context.Context) (byte, error) {
 //
 // An interrupted statement leaves the stream mid-frame, so the connection
 // cannot safely be reused: it is marked broken and database/sql discards it
-// (IsValid). The returned finish func clears the deadline, stops the watcher,
+// (IsValid). The returned finish func stops the watcher, clears the deadline,
 // and reports ctx.Err() in place of the resulting i/o timeout, so callers can
 // test errors.Is(err, context.DeadlineExceeded) / context.Canceled as they
 // would with any other driver.
+//
+// finish returns only once the watcher goroutine is gone. The connection
+// goes back to database/sql when the statement returns — to the pool, or to
+// the next statement on a pinned *sql.Conn — and a watcher that outlived the
+// statement would act on it there: a context cancelled after the statement
+// (`defer cancel()`) would break a healthy connection under its next user.
 func (c *conn) applyContext(ctx context.Context) func(error) error {
 	if ctx == nil {
 		return func(err error) error { return err }
@@ -916,10 +922,20 @@ func (c *conn) applyContext(ctx context.Context) func(error) error {
 			return err
 		}
 	}
-	done := make(chan struct{})
+	done := make(chan struct{})   // closed by finish: the statement is over
+	exited := make(chan struct{}) // closed by the watcher on its way out
 	go func() {
+		defer close(exited)
 		select {
 		case <-ctx.Done():
+			select {
+			case <-done:
+				// Both were ready and the context was drawn: the statement
+				// had finished, the connection is at a frame boundary and
+				// there is nothing to interrupt.
+				return
+			default:
+			}
 			if errors.Is(ctx.Err(), context.Canceled) {
 				c.cancelled.Store(true)
 			}
@@ -932,6 +948,7 @@ func (c *conn) applyContext(ctx context.Context) func(error) error {
 	return func(err error) error {
 		once.Do(func() {
 			close(done)
+			<-exited
 			_ = c.nc.SetDeadline(time.Time{})
 		})
 		if ctxErr := ctx.Err(); ctxErr != nil {

@@ -34,6 +34,9 @@ valid before every reuse, gets "no", closes it, and dials a fresh one (which
 goes through the load-balancing connector). You never see a poisoned
 connection, at the cost of one dial per cancelled statement.
 
+A context that is cancelled once its statement has returned — `defer
+cancel()` — touches nothing: the connection stays as the statement left it.
+
 ## What happens to the statement
 
 Unknown. The server may have executed it (a write applied, a `CREATE
